@@ -386,6 +386,30 @@ leave nothing behind, since some of them slow every game down.
 
 ### Step 1: find where the time goes
 
+For service-level diagnosis, `PW_WOW_SERVICE_TIMING=1` enables a separate,
+default-off histogram. On the console, create `pw_wow_service_timing` in the
+library root for one run and remove it afterwards. An explicit environment
+value other than `1` disables it, including when the file exists. It also
+enables the ordinary timing rows.
+
+`wowprospero services` reports cumulative valid span counts, wall nanoseconds,
+maximum span and counts at least 500 microseconds; `wowprospero service` lists
+the four service IDs with the largest cumulative wall totals. IDs are full
+32-bit numbers from the syscall BOP's EAX; map them using the exact runtime's
+service tables. These are spans from leaving the translator until its next
+entry, not kernel syscall counts or CPU time. They include dispatcher work,
+blocking and scheduling; a guest callback can end a span before its original
+service finishes. There are no guest-stack reads.
+
+The table holds 128 distinct IDs. New IDs after it fills go to explicit
+overflow totals; recorded IDs remain distinct. Clock errors, replaced pending
+spans and saturated counters are reported. A still-pending call appears in the
+final summary but contributes no fabricated duration. A thread stuck inside a
+service cannot emit periodic rows: use the existing wait watchdog
+([telemetry](TELEMETRY.md)) for live wait objects and stacks. The histogram
+adds two monotonic-clock reads per measured boundary and logging; compare
+only builds with matching diagnostics. It enables no wait or scheduler fix.
+
 Start with `--profiler timing`. If most of a busy thread's time is in `unix`
 or `sys`, the translator is not the problem; read
 [section 8](#8-when-a-game-is-slow-time-it-first). If it's in `run`, add
