@@ -9,6 +9,7 @@ import io
 import sys
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 sys.dont_write_bytecode = True  # no tools/__pycache__ for the publication audit
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
@@ -49,7 +50,7 @@ class Console:
             self.polls += 1
             if self.polls == 2:  # the run: snapshot what the title would see
                 for name in ("profiles/profiles.lst", "profiles/counter-strike-16.profile", "pw_script_keys", "pw_script_input", "pw_wow_timing",
-                             "pw_wow_exec_timing", "pw_wow_profile", "pw_wow_dispatch_profile",
+                             "pw_wow_exec_timing", "pw_wow_profile", "pw_wow_dispatch_profile", "pw_wow_service_timing",
                              "prefix/drive_c/Games/cs/listenserver.cfg", APP + "/" + run.RUNTIME):
                     entry = self.root / name
                     self.during[name] = entry.read_bytes() if entry.exists() else None
@@ -243,6 +244,24 @@ with tempfile.TemporaryDirectory() as directory:
     assert "profilers: exec-timing, dispatch-profile, timing, translator wowprospero.prx" in output
     assert "restored the app's own translator" in output and "removed the key script and the profiler triggers" in output
     assert (saved / "counter-strike-16-1790000000-demo.log").read_text() == "5182 frames 86.6 seconds 59.8 fps\n"
+
+# Service timing is scoped to the requested run, including timeout/signal.
+for finish, stop in ((True, False), (False, False), (False, True)):
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory) / "console"
+        library(root)
+        (root / "pw_wow_service_timing").write_text("stale\n")
+        console = Console(root, finish=finish, stop=stop)
+        try:
+            with patch.object(run.time, "monotonic", side_effect=(0, 0, 2)):
+                code, output = main(console, "--profiler", "service-timing", "--wait", "1")
+            assert not stop and code == (0 if finish else 1), output
+            assert "removing a stale pw_wow_service_timing" in output
+        except SystemExit as interrupted:
+            assert stop and interrupted.code == 143
+        assert console.during["pw_wow_service_timing"] == b"service-timing\n"
+        assert not (root / "pw_wow_service_timing").exists()
+        assert (root / "profiles/profiles.lst").read_text() == "half-life.profile\ncounter-strike-16.profile\n"
 
 # A translator the console can't load, a wrong app folder or a missing
 # --app is refused, and nothing stays changed.

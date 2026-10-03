@@ -74,6 +74,7 @@ PROFILERS = {
     "exec-timing": "pw_wow_exec_timing",            # CPU time in translated code, per thread
     "profile": "pw_wow_profile",                    # each thread's busiest translated blocks
     "dispatch-profile": "pw_wow_dispatch_profile",  # chain-table hits, empty slots and collisions
+    "service-timing": "pw_wow_service_timing",      # wall spans by full WoW64 service number
 }
 # The run's own trigger files: never kept after a run, even one that found a
 # stale copy left by an interrupted run.
