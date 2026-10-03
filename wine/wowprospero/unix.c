@@ -38,6 +38,7 @@
 #include "code_pages.h"
 #include "thread_budget.h"
 #include "host_memory.h"
+#include "service_timing.h"
 
 /* The guest range every translated access is checked against (load_state). */
 enum { GUEST_LOW = 0x10000u, GUEST_HIGH = 0xfffff000u };
@@ -79,6 +80,8 @@ struct pw_thread
     PwX86HotspotProfile *profile;
     uint64_t profile_last_dump;
     uint64_t execution_clock_cost, execution_clock_resolution;
+    PwWowServiceTiming *services;
+    unsigned services_attempted;
 };
 
 C_ASSERT( sizeof(((I386_CONTEXT *)0)->ExtendedRegisters) == PW_GUEST_FXSAVE_BYTES );
@@ -874,17 +877,20 @@ static NTSTATUS process_init( void *args )
 #define PW_WOW_TIMING_TRIGGER "/data/prospero-win/pw_wow_timing"
 #endif
 static int timing_enabled = -1;
+static int service_timing_enabled;
 
 static uint64_t timing_now_ns(void)
 {
     struct timespec now;
 
-    clock_gettime( CLOCK_MONOTONIC, &now );
+    if (clock_gettime( CLOCK_MONOTONIC, &now )) return 0;
     return now.tv_sec * 1000000000ull + now.tv_nsec;
 }
 
 static void timing_init(void)
 {
+    const char *services = getenv( "PW_WOW_SERVICE_TIMING" );
+    service_timing_enabled = services && !strcmp( services, "1" );
     timing_enabled = getenv( "PW_WOW_TIMING" ) != NULL || getenv( "PW_WOW_EXEC_TIMING" ) != NULL ||
                      getenv( "PW_WOW_DISPATCH_PROFILE" ) != NULL;
 #ifdef PW_WOW_TIMING_TRIGGER
@@ -894,8 +900,58 @@ static void timing_init(void)
         if (!stat( PW_WOW_TIMING_TRIGGER, &st )) timing_enabled = 1;
         if (!stat( "/data/prospero-win/pw_wow_exec_timing", &st )) timing_enabled = 1;
         if (!stat( "/data/prospero-win/pw_wow_dispatch_profile", &st )) timing_enabled = 1;
+        if (!services && !stat( "/data/prospero-win/pw_wow_service_timing", &st ))
+            service_timing_enabled = 1;
     }
 #endif
+    if (service_timing_enabled) timing_enabled = 1;
+}
+
+static void service_report( struct pw_thread *thread, unsigned final )
+{
+    const PwWowServiceTiming *p = thread->services;
+    const PwWowServiceEntry *top[PW_WOW_SERVICE_TOP];
+    if (!p) return;
+    unsigned count = pw_wow_service_top( p, top );
+    fprintf( stderr, "wowprospero services: tid=%04x instance=%llu cumulative=1 final=%u "
+             "calls=%llu wall_ns=%llu max_ns=%llu long_calls=%llu long_threshold_ns=%u "
+             "overflow_calls=%llu overflow_wall_ns=%llu overflow_max_ns=%llu overflow_long_calls=%llu "
+             "clock_errors=%llu abandoned=%llu pending=%u pending_id=%u saturated=%u\n",
+             (unsigned)(uintptr_t)NtCurrentTeb()->ClientId.UniqueThread,
+             (unsigned long long)thread->cache_report_id, final,
+             (unsigned long long)p->total.calls, (unsigned long long)p->total.wall_ns,
+             (unsigned long long)p->total.max_ns, (unsigned long long)p->total.long_calls,
+             PW_WOW_SERVICE_LONG_NS,
+             (unsigned long long)p->overflow.calls, (unsigned long long)p->overflow.wall_ns,
+             (unsigned long long)p->overflow.max_ns, (unsigned long long)p->overflow.long_calls,
+             (unsigned long long)p->clock_errors, (unsigned long long)p->abandoned,
+             p->pending, p->pending ? p->service : 0, p->saturated );
+    for (unsigned i = 0; i < count; i++) {
+        const PwWowServiceEntry *e = top[i];
+        fprintf( stderr, "wowprospero service: tid=%04x instance=%llu cumulative=1 final=%u "
+                 "id=%u calls=%llu wall_ns=%llu max_ns=%llu long_calls=%llu\n",
+                 (unsigned)(uintptr_t)NtCurrentTeb()->ClientId.UniqueThread,
+                 (unsigned long long)thread->cache_report_id, final, e->id,
+                 (unsigned long long)e->stats.calls, (unsigned long long)e->stats.wall_ns,
+                 (unsigned long long)e->stats.max_ns, (unsigned long long)e->stats.long_calls );
+    }
+}
+
+static void service_leave( struct pw_thread *thread, uint32_t reason )
+{
+    if (thread->services && reason == PW_WOW_SYSCALL)
+        pw_wow_service_begin( thread->services, thread->state.gpr[0], timing_now_ns() );
+}
+
+static void service_attach( struct pw_thread *thread )
+{
+    if (!service_timing_enabled || thread->services_attempted) return;
+    thread->services_attempted = 1;
+    thread->services = calloc( 1, sizeof(*thread->services) );
+    if (!thread->services)
+        fprintf( stderr, "wowprospero services_unavailable: tid=%04x instance=%llu allocation_failed=1\n",
+                 (unsigned)(uintptr_t)NtCurrentTeb()->ClientId.UniqueThread,
+                 (unsigned long long)thread->cache_report_id );
 }
 
 /* Owner-thread counters only: no table walk, signal-handler work or extra
@@ -920,6 +976,7 @@ static void cache_report( struct pw_thread *thread, uint64_t wall, unsigned fina
 static void timing_report( struct pw_thread *thread, uint64_t tsc )
 {
     uint64_t wall = timing_now_ns();
+    if (!wall || wall <= thread->wall_window) return;
     double cycles = (double)(tsc - thread->t_window);
     double seconds = (wall - thread->wall_window) / 1e9;
     double per_us = cycles / seconds / 1e6;
@@ -927,6 +984,7 @@ static void timing_report( struct pw_thread *thread, uint64_t tsc )
     execution_report( thread );
 
     cache_report( thread, wall, 0 );
+    service_report( thread, 0 );
     if (thread->n_unix + thread->n_sys > 1000)
         fprintf( stderr, "wowprospero timing: tid=%04x run=%.1f%% unix=%.1f%% (%.0f/s %.2fus) "
                  "sys=%.1f%% (%.0f/s %.2fus) other=%.1f%% (%u) unix_over_1ms=%.1f%% (%u) resets=%u flushes=%u\n",
@@ -949,6 +1007,8 @@ static void timing_report( struct pw_thread *thread, uint64_t tsc )
 /* At run()'s start: the time since the previous run returned. */
 static void timing_enter( struct pw_thread *thread )
 {
+    if (thread->services && thread->services->pending)
+        pw_wow_service_end( thread->services, timing_now_ns() );
     uint64_t tsc = __rdtsc(), outside = tsc - thread->t_mark;
 
     if (!thread->t_window)
@@ -1010,6 +1070,7 @@ static NTSTATUS run( void *args )
     }
     state = &thread->state;
     if (timing_enabled < 0) timing_init();
+    service_attach( thread );
     if (timing_enabled) timing_enter( thread );
     generation = __atomic_load_n( &code_generation, __ATOMIC_ACQUIRE );
     if (thread->generation != generation)
@@ -1070,6 +1131,9 @@ static NTSTATUS run( void *args )
     sync_fp_out( thread, ctx );
     if (timing_enabled) timing_leave( thread, params->reason );
     profile_maybe_dump();
+    /* Begin after reporting, just before returning to the PE dispatcher.
+     * EAX is still the full service number; the PE call replaces it with status. */
+    service_leave( thread, params->reason );
     return STATUS_SUCCESS;
 }
 
@@ -1120,10 +1184,12 @@ static NTSTATUS thread_term( void *args )
 
     if (!thread) return STATUS_SUCCESS;
     execution_report( thread );
+    service_report( thread, 1 );
     if (timing_enabled > 0) cache_report( thread, timing_now_ns(), 1 );
     self = NULL;
     if (thread->engine.fault_markers) register_arena( thread, 0 );
     free(thread->profile);
+    free(thread->services);
     pw_x86_hostexec_destroy( &thread->hostexec );
     pw_x86_engine_destroy( &thread->engine );
     release( thread->entries, 0 );
