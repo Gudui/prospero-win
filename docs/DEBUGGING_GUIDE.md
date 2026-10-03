@@ -416,6 +416,7 @@ it afterwards; you can name more than one.
 | `exec-timing` | `pw_wow_exec_timing` | Sampled CPU-time estimates inside translated code, per thread |
 | `profile` | `pw_wow_profile` | The 20 translated blocks each thread spends the most samples in, every five seconds |
 | `dispatch-profile` | `pw_wow_dispatch_profile` | How often a jump between blocks finds its target in the translator's chain table, finds the slot empty, or finds another block there |
+| `service-timing` | `pw_wow_service_timing` | Count, cumulative wall time, longest span and long-span count by WoW64 service number |
 
 They report through the game's log, which the console saves after every run
 and `pw_gameplay_run.py --save DIR` copies to your PC. If you start a game
@@ -425,8 +426,10 @@ leave nothing behind, since some of them slow every game down.
 ### Step 1: find where the time goes
 
 For service-level diagnosis, `PW_WOW_SERVICE_TIMING=1` enables a separate,
-default-off histogram. On the console, create `pw_wow_service_timing` in the
-library root for one run and remove it afterwards. An explicit environment
+default-off histogram. `--profiler service-timing` creates its trigger for one
+console run and removes it on completion, timeout or interruption. For manual
+runs, create `pw_wow_service_timing` in the library root and remove it afterwards.
+An explicit environment
 value other than `1` disables it, including when the file exists. It also
 enables the ordinary timing rows.
 
