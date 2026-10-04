@@ -36,11 +36,32 @@ def added_server_helpers():
     return core + "\n" + cold + "\n"
 
 
+def client_addition(file):
+    patch = ROOT / "wine/patches/0820-ntdll-ps5-shared-mutex-client.patch"
+    parts = patch.read_text().split("diff --git ")[1:]
+    part = next(p for p in parts if p.splitlines()[0].endswith(" b/" + file))
+    return "\n".join(line[1:] for line in part.splitlines()
+                     if line.startswith("+") and not line.startswith("+++")) + "\n"
+
+
+def added_metadata_policy():
+    added = client_addition("server/mutex.c")
+    start = added.index("int ps5_describe_mutex_word(")
+    brace = added.index("{", start)
+    depth = 1
+    for end in range(brace + 1, len(added)):
+        if added[end] == "{": depth += 1
+        if added[end] == "}": depth -= 1
+        if not depth: return added[start:end + 1] + "\n"
+    raise AssertionError("unterminated metadata policy")
+
+
 def main():
     with tempfile.TemporaryDirectory(prefix="pw-shared-mutex-word-") as temp:
         folder = Path(temp)
         (folder / "ps5_mutex_word.h").write_text(added_header())
-        (folder / "ps5_mutex_server.inc").write_text(added_server_helpers())
+        (folder / "ps5_mutex_backend.h").write_text(client_addition("include/wine/ps5_mutex_backend.h"))
+        (folder / "ps5_mutex_server.inc").write_text(added_server_helpers() + added_metadata_policy())
         binary = folder / "test"
         command = shlex.split(os.environ.get("CC", "cc"))
         command += shlex.split(os.environ.get("CFLAGS", "-O2 -g -Wall -Wextra -Werror"))

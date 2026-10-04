@@ -150,6 +150,14 @@ A Unix ntdll hit can remove request marshalling, global server locking,
 signal-mask changes and clock calls, while retaining the WoW64/syscall
 transition. Actual console operation cost must be measured.
 
+The existing 32-bit path can reach this Unix helper: `BTCpuSimulate` handles
+the syscall BOP through `Wow64SystemServiceEx`; the WoW64 wait/release
+wrappers call native `NtWaitForSingleObject` and `NtReleaseMutant`, whose
+Unix bodies call `server_try_fast_mutex`. That function selects the shared
+backend when its native API is present. The wait hook excludes alertable
+waits, and the existing inproc-device path precedes both hooks. This is a
+source trace, not evidence of actual runtime hits or of saved entry cost.
+
 After that backend passes console gates, a native hit at wowprospero's
 syscall BOP can call the same narrow helper before exiting the run loop.
 It requires its own register/stack/FP, signal, module and diagnostic
@@ -172,6 +180,14 @@ adoption, nested ordinary queued handoff, count-boundary recovery, owned
 close, and readiness downgrade retirement. The fixture frees retained cells
 only after all test readers have gone; production does not recycle them.
 Both binaries pass normally and under clang ASan/UBSan.
+
+The server fixture also compiles the actual `ps5_describe_mutex_word` body
+from 0820 with the 0810 helpers. Fourteen policy cases check invalid-handle
+and readiness retries, permanent negatives for valid ineligible objects,
+a live foreign owner's retry, access-zero metadata, distinct thread tokens,
+queued/abandoned SLOW metadata and retirement. Rejected calls preserve
+their native outputs and object references. The callbacks model handle
+lookup and legacy queues; they do not run real Wine waiters or abandonment.
 
 These checks establish primitive behavior and fixture-based server transfer.
 They do not run Wine, a game, console inputs, signal/termination races, or

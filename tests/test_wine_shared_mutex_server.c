@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 /* Exact added server helpers with native fixture objects and list/refcount
  * callbacks. No Wine process, asynchronous termination, signal or fault test. */
-#include "ps5_mutex_word.h"
+#include "ps5_mutex_backend.h"
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,7 +20,7 @@ static void list_add_tail(struct list *h,struct list *p) {
 }
 static void list_remove(struct list *p) { p->prev->next=p->next; p->next->prev=p->prev; }
 struct object_ops { int kind; };
-static const struct object_ops mutex_ops = {1}, mutex_sync_ops = {2};
+static const struct object_ops mutex_ops = {1}, mutex_sync_ops = {2}, other_ops = {3};
 struct object { unsigned refcount, handle_count; const struct object_ops *ops;
     struct list wait_queue; void *name; };
 struct process { struct object obj; struct list thread_list; };
@@ -41,7 +41,7 @@ static void release_object(void *p) { struct object *o=p; assert(o->refcount); -
 static struct object *get_handle_obj(struct process *p,obj_handle_t h,unsigned access,
                                      const struct object_ops *ops) {
     (void)p; assert(!access);
-    if (h != 4 || !handle_object || handle_object->obj.ops != ops) return NULL;
+    if (h != 4 || !handle_object || (ops && handle_object->obj.ops != ops)) return NULL;
     return grab_object(handle_object);
 }
 static unsigned get_handle_access(struct process *p,obj_handle_t h) { (void)p; assert(h==4); return fixture_access; }
@@ -76,6 +76,103 @@ static void observe(struct mutex_sync *m,struct thread *t,unsigned expected) {
         assert(list_empty(&t->mutex_list));
     }
 }
+
+static unsigned metadata_checks;
+static void expect_metadata_rejection(struct thread *thread,obj_handle_t handle,int expected) {
+    struct pw_mutex_word sentinel={0}, *word=&sentinel;
+    unsigned token=23,access=47;
+    struct mutex_sync *sync=(struct mutex_sync *)handle_object->sync;
+    unsigned wrapper_refs=handle_object->obj.refcount,sync_refs=sync->obj.refcount;
+    unsigned process_refs=thread->process->obj.refcount,count=sync->count;
+    struct thread *owner=sync->owner;
+    assert(!sync->fast && list_empty(&ps5_mutex_active) && list_empty(&ps5_mutex_pending));
+    ps5_mutex_server_begin();
+    assert(ps5_describe_mutex_word(thread,handle,&word,&token,&access)==expected);
+    ps5_mutex_server_end();
+    assert(word==&sentinel && token==23 && access==47 && !sentinel.word);
+    assert(handle_object->obj.refcount==wrapper_refs && sync->obj.refcount==sync_refs);
+    assert(thread->process->obj.refcount==process_refs && sync->owner==owner && sync->count==count);
+    assert(!sync->fast && list_empty(&ps5_mutex_active) && list_empty(&ps5_mutex_pending));
+    ++metadata_checks;
+}
+
+static void test_metadata_policy(void) {
+    struct process p={.obj={.refcount=1}},foreign_process={.obj={.refcount=1}};
+    struct thread a={.process=&p},b={.process=&p},foreign={.process=&foreign_process};
+    struct mutex_sync m={.obj={.refcount=1,.ops=&mutex_sync_ops}};
+    struct mutex wrapper={.obj={.refcount=1,.handle_count=1,.ops=&mutex_ops},
+        .sync=&m.obj,.fast_eligible=1};
+    list_init(&p.thread_list); list_init(&foreign_process.thread_list);
+    list_init(&a.mutex_list); list_init(&b.mutex_list); list_init(&foreign.mutex_list);
+    list_add_tail(&p.thread_list,&a.proc_entry); list_add_tail(&p.thread_list,&b.proc_entry);
+    list_add_tail(&foreign_process.thread_list,&foreign.proc_entry);
+    list_init(&m.obj.wait_queue); handle_object=&wrapper; fixture_access=0;
+
+    /* Actual policy, with valid native objects: only permanent ineligibility
+     * may be cached negative. Invalid handles and readiness recover. */
+    expect_metadata_rejection(&a,8,PW_MUTEX_LOOKUP_RETRY);
+    wrapper.obj.ops=&other_ops;
+    expect_metadata_rejection(&a,4,PW_MUTEX_LOOKUP_NEGATIVE); wrapper.obj.ops=&mutex_ops;
+    wrapper.fast_eligible=0;
+    expect_metadata_rejection(&a,4,PW_MUTEX_LOOKUP_NEGATIVE); wrapper.fast_eligible=1;
+    wrapper.obj.name=&p;
+    expect_metadata_rejection(&a,4,PW_MUTEX_LOOKUP_NEGATIVE); wrapper.obj.name=NULL;
+    wrapper.obj.handle_count=2;
+    expect_metadata_rejection(&a,4,PW_MUTEX_LOOKUP_NEGATIVE); wrapper.obj.handle_count=1;
+    m.obj.ops=&other_ops;
+    expect_metadata_rejection(&a,4,PW_MUTEX_LOOKUP_NEGATIVE); m.obj.ops=&mutex_sync_ops;
+    m.fast_disabled=1;
+    expect_metadata_rejection(&a,4,PW_MUTEX_LOOKUP_NEGATIVE); m.fast_disabled=0;
+    __atomic_store_n(&inprocess_direct_ok,0,__ATOMIC_RELEASE);
+    expect_metadata_rejection(&a,4,PW_MUTEX_LOOKUP_RETRY);
+    __atomic_store_n(&inprocess_direct_ok,1,__ATOMIC_RELEASE);
+    /* A live foreign legacy owner is retryable, not permanent cache poison. */
+    do_grab(&m,&foreign);
+    expect_metadata_rejection(&a,4,PW_MUTEX_LOOKUP_RETRY); legacy_release(&m,&foreign);
+    assert(list_empty(&foreign.mutex_list) && m.obj.refcount==1);
+
+    struct pw_mutex_word *word=NULL,*second=NULL;
+    unsigned token=0,second_token=0,access=47,second_access=47,previous=0;
+    ps5_mutex_server_begin();
+    assert(ps5_describe_mutex_word(&a,4,&word,&token,&access)==PW_MUTEX_LOOKUP_READY);
+    assert(word && token && !access && (pw_mutex_word_load(word)&PW_MUTEX_WORD_SLOW));
+    ps5_mutex_server_end(); assert(!pw_mutex_word_load(word)); ++metadata_checks;
+    struct ps5_mutex_cell *cell=m.fast;
+    /* Access-zero release is supported; wait access is left to the client. */
+    assert(pw_mutex_word_try_acquire(word,token));
+    assert(pw_mutex_word_try_release(word,token,&previous) && previous==1);
+    ps5_mutex_server_begin();
+    assert(ps5_describe_mutex_word(&b,4,&second,&second_token,&second_access)==PW_MUTEX_LOOKUP_READY);
+    ps5_mutex_server_end();
+    assert(second==word && second_token && second_token!=token && !second_access);
+    assert(m.fast==cell && p.obj.refcount==2 && m.obj.refcount==2); ++metadata_checks;
+
+    /* Queued and abandoned state still returns metadata, but the real word
+     * remains SLOW until ordinary semantics resolve the condition. */
+    struct wait_queue_entry wait;
+    ps5_mutex_server_begin(); assert(ps5_mutex_add_queue(&m.obj,&wait)); ps5_mutex_server_end();
+    ps5_mutex_server_begin();
+    assert(ps5_describe_mutex_word(&a,4,&second,&second_token,&second_access)==PW_MUTEX_LOOKUP_READY);
+    ps5_mutex_server_end();
+    assert(second==word && (pw_mutex_word_load(word)&PW_MUTEX_WORD_SLOW)); ++metadata_checks;
+    ps5_mutex_server_begin(); ps5_mutex_remove_queue(&m.obj,&wait); ps5_mutex_server_end();
+    assert(!pw_mutex_word_load(word));
+    ps5_mutex_server_begin(); ps5_mutex_enter_slow(&m); m.abandoned=1; ps5_mutex_server_end();
+    ps5_mutex_server_begin();
+    assert(ps5_describe_mutex_word(&a,4,&second,&second_token,&second_access)==PW_MUTEX_LOOKUP_READY);
+    ps5_mutex_server_end();
+    assert(second==word && (pw_mutex_word_load(word)&PW_MUTEX_WORD_SLOW)); ++metadata_checks;
+    ps5_mutex_server_begin(); ps5_mutex_enter_slow(&m); m.abandoned=0; ps5_mutex_server_end();
+    assert(!pw_mutex_word_load(word));
+
+    ps5_mutex_retire_object(&wrapper.obj);
+    assert(!m.fast && (pw_mutex_word_load(word)&PW_MUTEX_WORD_SLOW));
+    expect_metadata_rejection(&a,4,PW_MUTEX_LOOKUP_NEGATIVE);
+    assert(p.obj.refcount==1 && m.obj.refcount==1);
+    free(cell); handle_object=NULL; /* No fixture reader remains. */
+    assert(metadata_checks==14 && !ps5_mutex_operation_depth);
+}
+
 int main(void) {
     struct process p={.obj={.refcount=1}};
     struct thread a={.process=&p},b={.process=&p};
@@ -172,6 +269,8 @@ int main(void) {
     assert(!owned.fast && owned.obj.refcount==1 && p.obj.refcount==1);
     free(owned_cell); checked++;
     assert(!ps5_mutex_operation_depth);
+    test_metadata_policy();
     printf("PASS: %u actual server-helper observations, queued/nested recovery, retirement\n",checked);
+    printf("PASS: %u actual server metadata policy cases, retry/negative/ready distinctions\n",metadata_checks);
     return 0;
 }
