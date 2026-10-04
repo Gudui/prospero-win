@@ -35,8 +35,8 @@ Patch 0886 supplies server freeze/adopt hooks for queue insertion and
 removal, signaled/satisfied callbacks, queries, event set/reset/pulse and
 semaphore release. Its native metadata keeps a sync-object reference while
 a cell is active. It reuses the existing mutex request-depth, readiness and
-handle alias hooks, preserving the mutex ABI. No client activates these
-event/semaphore cells yet.
+handle alias hooks, preserving the mutex ABI. Patch 0886 alone has no
+runtime client; patch 0887 supplies the opt-in client below.
 
 Publication occurs only after the outermost server operation, with no
 remaining waiters or debug/module disable. Cold preparation admits only
@@ -56,10 +56,48 @@ authority, cold preparation, queue and retirement bodies with native fixture
 list/refcount callbacks. It checks 600 fast/legacy authority cycles, repeated
 slow entry, nested request completion, persistent waiters, state adoption,
 cold exclusions and pin/retirement lifetime. This fixture does not establish
-real Wine wait, APC or handle semantics. A separate versioned native ABI and
-client cache still need access and alertable-wait gates, complete SDK builds
-and the ordinary real-Wine console matrix plus matched performance and
-regression gates before activation.
+real Wine wait, APC or handle semantics.
+
+Patch 0887 adds an independent `pw_wineserver_sync_backend` versioned native
+ABI and exact paged handle cache. Its discovery validates version, structure,
+word and pointer sizes and both required pointers. Cold lookup uses the
+existing server lock, thread/TEB and pending-request gates, preserving thread
+and global errors. Native caller-local word/access outputs change only on a
+ready result. Invalid handles, allocation failures and unavailable server
+contexts retry; valid permanently ineligible handles have exact negative
+slots. Cache fills and all four existing close invalidations use
+`fd_cache_mutex`. Cell and page storage remains addressable through teardown;
+retired cells cannot be rebound to a new handle.
+
+The independent `WINE_PS5_SYNC_SHARED=1` or prefix-local `pw_sync_shared`
+containing exactly `1` with an optional newline enables discovery. Explicit
+environment settings win; absent, malformed and unreadable settings stay
+off. The shared and typed mutex selections and their existing ABI remain
+unchanged. Disabling direct server calls prevents discovery. Non-in-process
+builds return ordinary fallback from the same client entry point.
+
+Warm single-object non-alertable waits require cached `SYNCHRONIZE` access;
+event set/reset and semaphore release require their modify-state access.
+Operations attempt one word CAS, with no new server lock or signal section
+on a warm success. Empty waits, wrong types, invalid counts, maximum
+violations, contention, SLOW state and readiness downgrade fall back without
+changing output storage. The caller copies a successful local previous
+state/count to the application only after the helper returns. Alertable and
+multi-object waits, pulses, queries and SignalObjectAndWait retain ordinary
+Wine behavior and the server authority hooks from 0886.
+
+`python3 tests/test_wine_shared_sync_client.py` compiles the actual added ABI,
+switch, client cache and operation bodies, with bounded native metadata. It
+checks ABI mismatches, 15 server-context gates, all wait/modify permission
+combinations for each kind, event previous states, semaphore limits,
+36,000 warm operations without extra cold lookups or locks, 80 exact negative
+handles, invalid-handle/allocation retries, a second cache page, close/reuse,
+readiness/SLOW fallback and 12,000 protected semaphore sections across four
+live threads. It also compiles the ordinary non-in-process fallback wrapper.
+These tests do not run Wine or establish APC, signal, exception, wait-queue
+integration or console performance. The real-Wine console semantic matrix,
+matching module pair, HL2/load/city and 600-second stability gates remain
+required before runtime acceptance. No event/semaphore speedup is claimed.
 
 Status: experimental, default-off Unix client/server backend implemented,
 build-tested and measured on the console.
