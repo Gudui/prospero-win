@@ -1005,6 +1005,10 @@ The re-encoder keeps the original EIP, GPRs and arithmetic flags when a
 TZCNT/LZCNT memory guard refuses the source read. The instruction has not
 completed at that point. Regression checks cover 16- and 32-bit operands,
 with and without FS, and require a read fault at the effective address.
+This is a deliberate exception to the re-encoder's existing relaxation for
+dead flags on other flag-defining memory instructions. It matches the older
+emitter for these newly supported forms; it does not establish exact incoming
+flags for every faulting memory instruction.
 
 Periodic translated-run percentages describe wall-time attribution. They
 do not measure thread CPU utilization or the number of cores freed.
