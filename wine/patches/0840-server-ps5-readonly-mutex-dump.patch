@@ -11,7 +11,7 @@ synchronized query or evidence of a console performance improvement.
 diff --git a/server/mutex.c b/server/mutex.c
 --- a/server/mutex.c
 +++ b/server/mutex.c
-@@ -285,8 +285,23 @@
+@@ -285,7 +285,22 @@
  static void mutex_sync_dump( struct object *obj, int verbose )
  {
      struct mutex_sync *mutex = (struct mutex_sync *)obj;
@@ -35,4 +35,3 @@ diff --git a/server/mutex.c b/server/mutex.c
 +#endif
      fprintf( stderr, "Mutex count=%u owner=%p\n", mutex->count, mutex->owner );
  }
- 
