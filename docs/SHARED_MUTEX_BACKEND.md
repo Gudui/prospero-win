@@ -99,6 +99,22 @@ integration or console performance. The real-Wine console semantic matrix,
 matching module pair, HL2/load/city and 600-second stability gates remain
 required before runtime acceptance. No event/semaphore speedup is claimed.
 
+`tools/build_wine_sync_ordinary.py --out <artifact-directory>` compiles a
+bounded x86 PE32 console program using the public MinGW compiler. It imports
+only kernel32 and discovers the needed NTDLL exports normally. Its 12 case
+groups cover auto/manual state and previous values, semaphore maximum and
+previous count, independent wait/modify permissions, query/pulse transfer,
+partial and complete multiwait, SignalObjectAndWait, alertable dispatch,
+named/inheritable objects, aliases/close-source/recreation and two ordinary
+waiters for each kind. Workers have bounded waits and return normally; an
+unexpected failed join preserves their static storage and handles through
+process cleanup. The ready notifications allow coordinated scheduling but
+do not prove queue membership. The program reports checks and a final result
+in `pw-sync-ordinary.log`. Compile/header/import inspection does not execute
+the fixture or prove semantics. Compare baseline, candidate OFF and candidate
+ON on the console with all other settings and modules held fixed; APC delivery
+and the broader asynchronous signal/exception contracts remain separate.
+
 Status: experimental, default-off Unix client/server backend implemented,
 build-tested and measured on the console.
 Patch 0810 supplies server authority/lifetime hooks; 0820 adds the native ABI,

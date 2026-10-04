@@ -344,6 +344,8 @@ tests/fixtures/wine_shared_mutex_client.c
 tests/test_wine_shared_mutex_client.py
 tests/test_wine_shared_sync_client.py
 tests/fixtures/wine_shared_sync_client.c
+tests/fixtures/wine_sync_ordinary.c
+tools/build_wine_sync_ordinary.py
 wine/patches/0887-ntdll-ps5-shared-sync-client.patch
 wine/patches/0885-server-ps5-shared-sync-word.patch
 tests/fixtures/wine_shared_sync_word.c
