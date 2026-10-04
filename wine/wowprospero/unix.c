@@ -914,26 +914,29 @@ static void service_report( struct pw_thread *thread, unsigned final )
     if (!p) return;
     unsigned count = pw_wow_service_top( p, top );
     fprintf( stderr, "wowprospero services: tid=%04x instance=%llu cumulative=1 final=%u "
-             "calls=%llu wall_ns=%llu max_ns=%llu long_calls=%llu long_threshold_ns=%u "
-             "overflow_calls=%llu overflow_wall_ns=%llu overflow_max_ns=%llu overflow_long_calls=%llu "
+             "calls=%llu wall_ns=%llu max_ns=%llu long_calls=%llu long_wall_ns=%llu long_threshold_ns=%u "
+             "overflow_calls=%llu overflow_wall_ns=%llu overflow_max_ns=%llu overflow_long_calls=%llu overflow_long_wall_ns=%llu "
              "clock_errors=%llu abandoned=%llu pending=%u pending_id=%u saturated=%u\n",
              (unsigned)(uintptr_t)NtCurrentTeb()->ClientId.UniqueThread,
              (unsigned long long)thread->cache_report_id, final,
              (unsigned long long)p->total.calls, (unsigned long long)p->total.wall_ns,
              (unsigned long long)p->total.max_ns, (unsigned long long)p->total.long_calls,
+             (unsigned long long)p->total.long_wall_ns,
              PW_WOW_SERVICE_LONG_NS,
              (unsigned long long)p->overflow.calls, (unsigned long long)p->overflow.wall_ns,
              (unsigned long long)p->overflow.max_ns, (unsigned long long)p->overflow.long_calls,
+             (unsigned long long)p->overflow.long_wall_ns,
              (unsigned long long)p->clock_errors, (unsigned long long)p->abandoned,
              p->pending, p->pending ? p->service : 0, p->saturated );
     for (unsigned i = 0; i < count; i++) {
         const PwWowServiceEntry *e = top[i];
         fprintf( stderr, "wowprospero service: tid=%04x instance=%llu cumulative=1 final=%u "
-                 "id=%u calls=%llu wall_ns=%llu max_ns=%llu long_calls=%llu\n",
+                 "id=%u calls=%llu wall_ns=%llu max_ns=%llu long_calls=%llu long_wall_ns=%llu\n",
                  (unsigned)(uintptr_t)NtCurrentTeb()->ClientId.UniqueThread,
                  (unsigned long long)thread->cache_report_id, final, e->id,
                  (unsigned long long)e->stats.calls, (unsigned long long)e->stats.wall_ns,
-                 (unsigned long long)e->stats.max_ns, (unsigned long long)e->stats.long_calls );
+                 (unsigned long long)e->stats.max_ns, (unsigned long long)e->stats.long_calls,
+                 (unsigned long long)e->stats.long_wall_ns );
     }
 }
 

@@ -8,7 +8,7 @@
 enum { PW_WOW_SERVICE_SLOTS = 128, PW_WOW_SERVICE_TOP = 4,
        PW_WOW_SERVICE_LONG_NS = 500000 };
 typedef struct PwWowServiceStats {
-    uint64_t calls, wall_ns, max_ns, long_calls;
+    uint64_t calls, wall_ns, max_ns, long_calls, long_wall_ns;
 } PwWowServiceStats;
 typedef struct PwWowServiceEntry {
     PwWowServiceStats stats;
@@ -42,7 +42,10 @@ static inline void pw_wow_service_record(PwWowServiceTiming *p, PwWowServiceStat
     s->calls = pw_wow_service_add(p, s->calls, 1);
     s->wall_ns = pw_wow_service_add(p, s->wall_ns, ns);
     if (ns > s->max_ns) s->max_ns = ns;
-    if (ns >= PW_WOW_SERVICE_LONG_NS) s->long_calls = pw_wow_service_add(p, s->long_calls, 1);
+    if (ns >= PW_WOW_SERVICE_LONG_NS) {
+        s->long_calls = pw_wow_service_add(p, s->long_calls, 1);
+        s->long_wall_ns = pw_wow_service_add(p, s->long_wall_ns, ns);
+    }
 }
 
 static inline void pw_wow_service_end(PwWowServiceTiming *p, uint64_t now)

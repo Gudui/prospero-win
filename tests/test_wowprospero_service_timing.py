@@ -114,6 +114,7 @@ int main(void)
     service_leave(&thread,PW_WOW_SYSCALL); clock_fail=1;
     now+=100; ticks+=100; timing_enter(&thread);
     assert(thread.services->clock_errors==1 && thread.services->total.calls==1);
+    assert(thread.services->total.long_wall_ns==235000000000ull);
     clock_fail=0;
     now+=500001; ticks+=100;
     timing_report(&thread,ticks);
@@ -127,6 +128,17 @@ int main(void)
     assert(thread.services->total.calls==2 && thread.last_reason==PW_WOW_SYSCALL);
     thread.state.gpr[0]=0x2000; service_leave(&thread,PW_WOW_SYSCALL);
     service_report(&thread,1); /* Still pending, never fabricated as complete. */
+    /* Exercise real overflow formatting with durations on either side of threshold. */
+    pw_wow_service_end(thread.services,now+500000);
+    for(unsigned i=0;i<PW_WOW_SERVICE_SLOTS;i++) {
+        pw_wow_service_begin(thread.services,0x10000+i,100);
+        pw_wow_service_end(thread.services,101);
+    }
+    pw_wow_service_begin(thread.services,0x30000,100);
+    pw_wow_service_end(thread.services,100+499999);
+    pw_wow_service_begin(thread.services,0x30000,100);
+    pw_wow_service_end(thread.services,100+500000);
+    service_report(&thread,1);
     free(thread.services);
     return 0;
 }
@@ -151,9 +163,18 @@ with tempfile.TemporaryDirectory() as directory:
                if "wowprospero service:" in line]
     assert summaries[0]["calls"] == "1" and summaries[0]["wall_ns"] == "235000000000"
     assert entries[0]["id"] == "4096" and entries[0]["max_ns"] == "235000000000"
-    assert summaries[-1]["final"] == "1" and summaries[-1]["pending"] == "1"
-    assert summaries[-1]["pending_id"] == "8192" and summaries[-1]["clock_errors"] == "1"
-    assert summaries[-1]["calls"] == "2" and summaries[-1]["instance"] == "7"
+    assert summaries[0]["long_wall_ns"] == entries[0]["long_wall_ns"] == "235000000000"
+    pending = summaries[-2]
+    assert pending["final"] == "1" and pending["pending"] == "1"
+    assert pending["pending_id"] == "8192" and pending["clock_errors"] == "1"
+    assert pending["calls"] == "2" and pending["instance"] == "7"
+    assert pending["long_wall_ns"] == "235000000000"  # Short and pending spans excluded.
+    assert summaries[-1]["long_wall_ns"] == "235001000000"
+    assert summaries[-1]["overflow_long_wall_ns"] == "500000"
+    assert summaries[-1]["overflow_long_calls"] == "1"
+    assert summaries[-1]["overflow_wall_ns"] == "1000001"
+    assert any(row["id"] == "8192" and row["long_wall_ns"] == "500000" for row in entries)
     assert "allocation_failed=1" in lines[0]
 print("native service timing passed: default off, trigger/env override, allocation failure, BOP ID, "
-      "235-second span, bad clocks, real timing integration, cumulative final rows and pending call")
+      "235-second span, bad clocks, real timing integration, cumulative final rows, pending call "
+      "and long wall totals including overflow")
