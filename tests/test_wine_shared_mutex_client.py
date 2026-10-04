@@ -69,7 +69,7 @@ def main():
             assert switch.count(before) == 1 and after in body
             switch = switch.replace(before, after)
         # Apply the separate default-selection patch to that exact switch body.
-        default_patch = ROOT / 'wine/patches/0880-ntdll-ps5-shared-mutex-default.patch'
+        default_patch = ROOT / 'wine/patches/0880-wine-ps5-runtime-defaults.patch'
         default_changes = additions(default_patch, 'dlls/ntdll/unix/server.c')
         replacements = [
             ('static int server_mutex_switch_enabled( const char *environment, const char *file_name )',

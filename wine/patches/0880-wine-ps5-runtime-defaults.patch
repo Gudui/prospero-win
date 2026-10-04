@@ -1,12 +1,16 @@
 From: Prospero Win contributors <prospero-win@localhost>
-Subject: [PATCH] ntdll: Default to the compatible shared mutex backend.
+Subject: [PATCH] wine: Enable shared mutex and image-view cleanup defaults.
 
 Select the shared backend when no explicit setting exists, retaining the
 independent default-off typed backend. Exact environment or prefix values
 still override selection; malformed/unreadable files stay off. Direct
 server disable and missing/incompatible ABI exports keep ordinary Wine.
 
-This changes selection only; new console comparisons gate deployment.
+Also select image-view descriptor cleanup when the prefix setting is absent.
+Explicit off values, malformed settings and read/open errors retain ordinary
+behavior. Both options remain independently selectable.
+
+This changes selection only; matching-pair console comparisons gate deployment.
 
 diff --git a/dlls/ntdll/unix/server.c b/dlls/ntdll/unix/server.c
 --- a/dlls/ntdll/unix/server.c
@@ -84,3 +88,60 @@ diff --git a/dlls/ntdll/unix/server.c b/dlls/ntdll/unix/server.c
      fprintf( stderr, "wine-ps5: immediate mutex calls: %s\n", try_server_mutex ? "on" : "off" );
      TRACE( "connected to the in-process server %s\n", module_path );
      free( dir );
+
+diff --git a/server/fd.c b/server/fd.c
+--- a/server/fd.c
++++ b/server/fd.c
+@@ -1900,39 +1900,42 @@
+     }
+     return fd;
+ 
+ failed:
+     release_object( fd );
+     return NULL;
+ }
+ 
+-/* Opt-in resource cleanup; read the prefix setting once, without retaining a file. */
++/* Resource cleanup; read the prefix setting once, without retaining a file. */
+ int ps5_image_view_fd_release_enabled(void)
+ {
+ #ifdef __PROSPERO__
+     static int enabled = -1;
+     const char *value;
+     char buffer[3];
+     int file, result = 0, saved_errno = errno;
+     size_t count = 0;
+     ssize_t size = -1;
+ 
+     if (enabled != -1) return enabled;
+     if ((value = getenv( "WINE_PS5_IMAGE_VIEW_FD_RELEASE" )))
+         result = !strcmp( value, "1" );
+-    else if (config_dir_fd != -1 &&
+-             (file = openat( config_dir_fd, "pw_image_view_fd_release", O_RDONLY )) != -1)
+-    {
+-        while (count < sizeof(buffer) &&
+-               (size = read( file, buffer + count, sizeof(buffer) - count )) > 0)
+-            count += size;
+-        close( file );
+-        result = size == 0 && (count == 1 || (count == 2 && buffer[1] == '\n')) &&
+-                 buffer[0] == '1';
++    else if (config_dir_fd != -1)
++    {
++        if ((file = openat( config_dir_fd, "pw_image_view_fd_release", O_RDONLY )) != -1)
++        {
++            while (count < sizeof(buffer) &&
++                   (size = read( file, buffer + count, sizeof(buffer) - count )) > 0)
++                count += size;
++            close( file );
++            result = size == 0 && (count == 1 || (count == 2 && buffer[1] == '\n')) &&
++                     buffer[0] == '1';
++        }
++        else if (errno == ENOENT) result = 1;
+     }
+     enabled = result;
+     fprintf( stderr, "wine-ps5: image-view fd release: %s\n", enabled ? "on" : "off" );
+     errno = saved_errno;
+     return enabled;
+ #else
+     return 0;
+ #endif

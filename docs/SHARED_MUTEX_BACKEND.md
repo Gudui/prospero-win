@@ -151,7 +151,9 @@ connection and the switch file is closed immediately.
 
 The measured results above used explicit selection with the original
 0820 modules. They support the default-on proposal but do not validate its
-new NTDLL revision. Require matching OFF/default-ON module receipts,
+new matching server/NTDLL pair. Patch 0880 also selects image-view descriptor
+cleanup by default, with its independent explicit off switch; see
+[the lifetime contract](IMAGE_VIEW_FD_LIFETIME.md). Require matching OFF/default-ON module receipts,
 ordinary PE semantics, HL2 timedemo/clean exit, load and 600-second gameplay
 results before merging the default-selection change. The 58/50 FPS target
 remains unchanged.
