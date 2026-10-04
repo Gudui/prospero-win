@@ -54,7 +54,7 @@ would change this behavior.
 ## Server preparation
 
 The server hooks freeze/adopt before ordinary queue insertion, signaled
-checks, ownership changes, release, query, SignalObjectAndWait, dump and
+checks, ownership changes, release, query, SignalObjectAndWait and
 0790's `try_fast_mutex` in `server/mutex.c`. Wrapper close/destruction and
 alias allocation retire the cell before dropping references or publishing
 a new alias. The generic handle reference hook covers inheritance; the
@@ -81,9 +81,18 @@ signals and does not yet prove that protocol.
 
 The internal activation policy excludes named, initially inheritable,
 global and previously aliased/retired objects. Cells use separate aligned
-allocations, avoiding a fixed arena capacity; retired word storage is
-intentionally retained for the module lifetime. Allocation/token exhaustion
-falls back. Memory growth must be checked during the 600-second gate.
+allocations; retired word storage is intentionally retained for the module
+lifetime. Patch 0850 limits successful allocations to 8,192 for that lifetime.
+A compile-time bound of 128 bytes per cell caps requested cell payload at
+1 MiB, excluding allocator overhead. Retirement does not return quota and
+never recycles a cached address. Already active cells remain usable at the
+cap; a new quota-denied sync permanently uses ordinary Wine semantics and
+its first metadata lookup returns a negative. Allocation, token and readiness
+failures remain retryable. The quota counter is accessed under the server
+lock and increases only on successful allocation. This limit does not cover
+ordinary Wine objects or the separately bounded client pages. Cold admission
+for seldom-used candidates remains a separate optimization, and actual
+memory use must still be checked during the 600-second gate.
 Normal contention, multiwaits and deep recursion can recover fast mode when
 their conditions permit it.
 
@@ -162,7 +171,7 @@ labelled `shared snapshot`. Another client may change that word immediately
 afterward. With SLOW, inactive or retired state it prints the legacy count
 and owner pointer under the server lock. It does not set SLOW, adopt an
 owner, change references or queue publication. Native checks compile the
-actual patched dump and verify 4,775 outputs with unchanged state through
+actual patched dump and verify 4,776 outputs with unchanged state through
 ordinary ownership transfers, recursion, retirement and inactive legacy
 ownership.
 This does not establish runtime integration or a console performance gain.
@@ -211,6 +220,14 @@ a live foreign owner's retry, access-zero metadata, distinct thread tokens,
 queued/abandoned SLOW metadata and retirement. Rejected calls preserve
 their native outputs and object references. The callbacks model handle
 lookup and legacy queues; they do not run real Wine waiters or abandonment.
+
+The fixture also applies 0850 to the actual server helpers and metadata
+policy. Eight quota cases position the counter at one remaining slot and
+check a controlled allocator miss, the final successful allocation, continued
+use of an active cell at the cap, permanent ordinary fallback with intact
+legacy ownership and outputs, repeat negatives, retirement without quota
+recovery, and readiness retry before a permanent quota negative. The fixture
+does not allocate thousands of cells or exhaust resources.
 
 These checks establish primitive behavior and fixture-based server transfer.
 They do not run Wine, a game, console inputs, signal/termination races, or

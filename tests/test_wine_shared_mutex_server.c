@@ -62,7 +62,16 @@ static void legacy_release(struct mutex_sync *m,struct thread *t) {
     ps5_mutex_enter_slow(m); assert(m->count && m->owner==t);
     if (!--m->count) { list_remove(&m->entry); m->owner=NULL; release_object(m); }
 }
+static unsigned allocation_calls;
+static int fail_next_allocation;
+static int fixture_aligned_alloc(void **storage,size_t alignment,size_t size) {
+    ++allocation_calls;
+    if (fail_next_allocation) { fail_next_allocation=0; return 12; }
+    return posix_memalign(storage,alignment,size);
+}
+#define posix_memalign fixture_aligned_alloc
 #include "ps5_mutex_server.inc"
+#undef posix_memalign
 
 /* Compile the exact patched dump; only its output destination is a native
  * bounded callback so we can assert contents without noisy diagnostics. */
@@ -217,6 +226,101 @@ static void test_metadata_policy(void) {
     assert(metadata_checks==14 && !ps5_mutex_operation_depth);
 }
 
+static unsigned quota_checks;
+static void test_retained_cell_limit(void) {
+    struct process p={.obj={.refcount=1}};
+    struct thread a={.process=&p};
+    struct mutex_sync last={.obj={.refcount=1,.ops=&mutex_sync_ops}};
+    struct mutex_sync denied={.obj={.refcount=1,.ops=&mutex_sync_ops}};
+    struct mutex_sync later={.obj={.refcount=1,.ops=&mutex_sync_ops}};
+    struct mutex last_wrapper={.obj={.refcount=1,.handle_count=1,.ops=&mutex_ops},
+        .sync=&last.obj,.fast_eligible=1};
+    struct mutex denied_wrapper={.obj={.refcount=1,.handle_count=1,.ops=&mutex_ops},
+        .sync=&denied.obj,.fast_eligible=1};
+    struct mutex later_wrapper={.obj={.refcount=1,.handle_count=1,.ops=&mutex_ops},
+        .sync=&later.obj,.fast_eligible=1};
+    struct pw_mutex_word sentinel={0},*word=&sentinel,*again=&sentinel;
+    unsigned token=23,access=47,before=0,calls=allocation_calls;
+    list_init(&p.thread_list); list_init(&a.mutex_list); list_add_tail(&p.thread_list,&a.proc_entry);
+    list_init(&last.obj.wait_queue); list_init(&denied.obj.wait_queue); list_init(&later.obj.wait_queue);
+    assert(list_empty(&ps5_mutex_active) && list_empty(&ps5_mutex_pending));
+    /* Fixture-only quota positioning uses one last slot. It does not create
+     * thousands of cells or exhaust host resources. Production never resets
+     * or decrements this server-lock-protected lifetime counter. */
+    ps5_mutex_retained_cells=PW_MUTEX_RETAINED_CELL_LIMIT-1;
+    handle_object=&last_wrapper; fixture_access=0x100000; fail_next_allocation=1;
+    ps5_mutex_server_begin();
+    assert(ps5_describe_mutex_word(&a,4,&word,&token,&access)==PW_MUTEX_LOOKUP_RETRY);
+    ps5_mutex_server_end();
+    assert(word==&sentinel && token==23 && access==47 && !sentinel.word);
+    assert(!last.fast && !last.fast_disabled && last.obj.refcount==1 && p.obj.refcount==1);
+    assert(ps5_mutex_retained_cells==PW_MUTEX_RETAINED_CELL_LIMIT-1);
+    assert(allocation_calls==calls+1); ++quota_checks;
+
+    ps5_mutex_server_begin();
+    assert(ps5_describe_mutex_word(&a,4,&word,&token,&access)==PW_MUTEX_LOOKUP_READY);
+    ps5_mutex_server_end();
+    assert(word && word!=&sentinel && token && access==0x100000);
+    assert(ps5_mutex_retained_cells==PW_MUTEX_RETAINED_CELL_LIMIT && allocation_calls==calls+2);
+    struct ps5_mutex_cell *cell=last.fast; ++quota_checks;
+    /* Re-describing an already active cell remains ready at the cap. */
+    unsigned second_token=23,second_access=47;
+    ps5_mutex_server_begin();
+    assert(ps5_describe_mutex_word(&a,4,&again,&second_token,&second_access)==PW_MUTEX_LOOKUP_READY);
+    ps5_mutex_server_end();
+    assert(again==word && second_token==token && second_access==access && last.fast==cell);
+    assert(allocation_calls==calls+2 && ps5_mutex_retained_cells==PW_MUTEX_RETAINED_CELL_LIMIT);
+    assert(pw_mutex_word_try_acquire(word,token) && pw_mutex_word_try_acquire(word,token));
+    assert(pw_mutex_word_try_release(word,token,&before) && before==2);
+    assert(pw_mutex_word_try_release(word,token,&before) && before==1); ++quota_checks;
+
+    /* A quota-denied ordinary owned sync remains owned, with the exact
+     * legacy list/reference contract and caller metadata outputs preserved. */
+    do_grab(&denied,&a); do_grab(&denied,&a); handle_object=&denied_wrapper;
+    again=&sentinel; second_token=23; second_access=47;
+    struct list owner_list=a.mutex_list;
+    ps5_mutex_server_begin();
+    assert(ps5_describe_mutex_word(&a,4,&again,&second_token,&second_access)==PW_MUTEX_LOOKUP_NEGATIVE);
+    ps5_mutex_server_end();
+    assert(again==&sentinel && second_token==23 && second_access==47 && !sentinel.word);
+    assert(!denied.fast && denied.fast_disabled && denied.owner==&a && denied.count==2);
+    assert(denied.obj.refcount==2 && denied_wrapper.obj.refcount==1 && p.obj.refcount==2);
+    assert(!memcmp(&owner_list,&a.mutex_list,sizeof(owner_list)) && allocation_calls==calls+2);
+    ++quota_checks; check_dump(&denied,&a);
+    ps5_mutex_server_begin();
+    assert(ps5_describe_mutex_word(&a,4,&again,&second_token,&second_access)==PW_MUTEX_LOOKUP_NEGATIVE);
+    ps5_mutex_server_end();
+    assert(allocation_calls==calls+2 && again==&sentinel && second_token==23 && second_access==47);
+    legacy_release(&denied,&a); legacy_release(&denied,&a);
+    assert(!denied.owner && !denied.count && denied.obj.refcount==1 && list_empty(&a.mutex_list));
+    ++quota_checks;
+
+    ps5_mutex_retire_object(&last_wrapper.obj);
+    assert(!last.fast && p.obj.refcount==1 && last.obj.refcount==1);
+    assert(pw_mutex_word_load(word)&PW_MUTEX_WORD_SLOW);
+    assert(ps5_mutex_retained_cells==PW_MUTEX_RETAINED_CELL_LIMIT); ++quota_checks;
+    /* No active cell remains, but retired readable storage still consumes
+     * lifetime quota. A readiness miss does not mark a new sync negative. */
+    assert(list_empty(&ps5_mutex_active) && list_empty(&ps5_mutex_pending));
+    handle_object=&later_wrapper;
+    __atomic_store_n(&inprocess_direct_ok,0,__ATOMIC_RELEASE);
+    ps5_mutex_server_begin();
+    assert(ps5_describe_mutex_word(&a,4,&again,&second_token,&second_access)==PW_MUTEX_LOOKUP_RETRY);
+    ps5_mutex_server_end();
+    assert(!later.fast_disabled && !later.fast && allocation_calls==calls+2); ++quota_checks;
+    __atomic_store_n(&inprocess_direct_ok,1,__ATOMIC_RELEASE);
+    ps5_mutex_server_begin();
+    assert(ps5_describe_mutex_word(&a,4,&again,&second_token,&second_access)==PW_MUTEX_LOOKUP_NEGATIVE);
+    ps5_mutex_server_end();
+    assert(later.fast_disabled && !later.fast && !later.owner && !later.count);
+    assert(again==&sentinel && second_token==23 && second_access==47 && !sentinel.word);
+    assert(later.obj.refcount==1 && later_wrapper.obj.refcount==1 && p.obj.refcount==1);
+    assert(ps5_mutex_retained_cells==PW_MUTEX_RETAINED_CELL_LIMIT && allocation_calls==calls+2);
+    assert(!ps5_mutex_operation_depth); ++quota_checks;
+    free(cell); handle_object=NULL; /* Fixture teardown only, no readers. */
+    assert(quota_checks==8);
+}
+
 int main(void) {
     struct process p={.obj={.refcount=1}};
     struct thread a={.process=&p},b={.process=&p};
@@ -317,8 +421,10 @@ int main(void) {
     free(owned_cell); checked++;
     assert(!ps5_mutex_operation_depth);
     test_metadata_policy();
+    test_retained_cell_limit();
     printf("PASS: %u actual server-helper observations, queued/nested recovery, retirement\n",checked);
     printf("PASS: %u actual server metadata policy cases, retry/negative/ready distinctions\n",metadata_checks);
     printf("PASS: %u read-only dump snapshots with unchanged ownership, lists and references\n",dump_checks);
+    printf("PASS: %u retained-cell quota cases, one controlled last slot, no recycled storage\n",quota_checks);
     return 0;
 }

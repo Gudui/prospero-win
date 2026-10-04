@@ -79,7 +79,11 @@ def main():
         folder = Path(temp)
         (folder / "ps5_mutex_word.h").write_text(added_header())
         (folder / "ps5_mutex_backend.h").write_text(client_addition("include/wine/ps5_mutex_backend.h"))
-        (folder / "ps5_mutex_server.inc").write_text(added_server_helpers() + added_metadata_policy())
+        from test_wine_shared_mutex_client import apply_hunks
+        server = apply_hunks(added_server_helpers() + added_metadata_policy(),
+                             ROOT / "wine/patches/0850-server-ps5-shared-mutex-retained-cap.patch",
+                             "server/mutex.c")
+        (folder / "ps5_mutex_server.inc").write_text(server)
         (folder / "ps5_mutex_dump.inc").write_text(reconstructed_dump())
         binary = folder / "test"
         command = shlex.split(os.environ.get("CC", "cc"))

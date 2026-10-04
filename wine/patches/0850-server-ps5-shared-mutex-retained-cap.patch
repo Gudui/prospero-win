@@ -1,0 +1,52 @@
+From: Prospero Win contributors <prospero-win@localhost>
+Subject: [PATCH] server: cap retained shared mutex cell allocations
+
+Depends on 0820. Retired cells cannot be recycled while native cached
+readers may still hold their addresses. Limit lifetime successful cell
+allocations to 8192; existing cells remain usable at the quota. A new
+quota-denied eligible sync becomes permanently ordinary and yields a
+negative metadata result on that same lookup. Transient allocator and
+readiness failures remain retryable. Server locking protects the monotonic
+counter; retirement never returns quota. Payload is at most one MiB,
+excluding allocator overhead, with a compile-time cell-size bound.
+
+diff --git a/server/mutex.c b/server/mutex.c
+--- a/server/mutex.c
++++ b/server/mutex.c
+@@ -152,6 +152,11 @@
+ static struct list ps5_mutex_pending = LIST_INIT(ps5_mutex_pending);
+ static unsigned int ps5_mutex_operation_depth;
+ static unsigned int ps5_mutex_last_token;
++/* Lifetime quota: retired cells stay readable and are never recycled.
++ * The server lock serializes allocation and this monotonic counter. */
++#define PW_MUTEX_RETAINED_CELL_LIMIT 8192u
++_Static_assert( sizeof(struct ps5_mutex_cell) <= 128, "shared mutex cell payload bound" );
++static unsigned int ps5_mutex_retained_cells;
+
+ static unsigned int ps5_mutex_thread_token( struct thread *thread )
+ {
+@@ -468,7 +473,15 @@
+     if (sync->fast_disabled || (sync->owner && sync->owner->process != thread->process)) goto done;
+     if (!(cell = sync->fast))
+     {
++        if (ps5_mutex_retained_cells >= PW_MUTEX_RETAINED_CELL_LIMIT)
++        {
++            /* The lifetime quota cannot recover. Keep this valid sync on
++             * ordinary semantics; do not retry or reuse retired storage. */
++            sync->fast_disabled = 1;
++            goto done;
++        }
+         if (posix_memalign( &storage, 64, sizeof(*cell) )) goto done;
++        ++ps5_mutex_retained_cells;
+         cell = storage;
+         memset( cell, 0, sizeof(*cell) );
+         cell->word.word = PW_MUTEX_WORD_SLOW;
+@@ -506,6 +519,8 @@
+             ret = PW_MUTEX_LOOKUP_NEGATIVE;
+         else if (ps5_get_mutex_word( thread, handle, word, token, access ))
+             ret = PW_MUTEX_LOOKUP_READY;
++        else if (((struct mutex_sync *)mutex->sync)->fast_disabled)
++            ret = PW_MUTEX_LOOKUP_NEGATIVE;
+     }
+     release_object( obj );
+     return ret;
