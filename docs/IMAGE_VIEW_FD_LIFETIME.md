@@ -77,3 +77,23 @@ Wine execution or a console resource-limit test. Run normally and with
 clang ASan/UBSan; console validation must compare the same module pair with
 selection off/on and ordinary image load/unload, section reuse, sharing,
 HL2 and the fixed gameplay route.
+
+`tools/build_wine_image_ordinary.py --out <artifact-directory>` prepares a
+bounded x86 PE32 console fixture with kernel32-only imports. It copies only
+its own executable to a unique filename, without overwriting existing files,
+and maps that owned copy through ordinary Win32 APIs. Six case groups cover
+later views from a live section after source-file close, retained views after
+section close with a fresh section of the same file, multiple sections and
+the last mapping owner, image sharing restrictions after section close, and
+data/anonymous mapping lifetime. It checks committed readable view metadata
+and its own image header/value, unmaps each successful view and deletes its
+owned copy. The sharing case requests write access without writing bytes.
+The fixture uses bounded handle counts and performs no resource-limit probe.
+Results are written to `pw-image-ordinary.log`.
+
+Compile and PE/import inspection do not execute Wine or establish lifetime
+semantics. The console gate must compare the accepted pair and the candidate
+pair with cleanup OFF/ON, keeping other settings fixed. Record all case
+results, Wine-exit and the cleanup marker in the candidate-ON arm. This fixture
+does not cover debugger attachment, writable shared image sections or every
+file-delete/lock/async dependency; those remain separate contracts.
