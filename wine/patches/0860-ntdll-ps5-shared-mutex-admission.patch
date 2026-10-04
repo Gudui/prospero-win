@@ -1,0 +1,69 @@
+From: Prospero Win contributors <prospero-win@localhost>
+Subject: [PATCH] ntdll: admit shared mutex candidates after repeated use
+
+Depends on 0830. Encode seven ordinary hook attempts in the candidate tag
+before allowing cold lookup on a subsequent attempt. Probation has no
+server metadata call, cache lock, signal-mask change or cell allocation.
+Use one bounded atomic compare/exchange and retain ordinary fallback even
+when it loses a race. Cold fill rechecks admission under fd_cache_mutex,
+so close/create reuse starts fresh. Retry retains the ready marker; positive
+words and negative slots preserve their existing behavior. No ABI changes.
+This filter counts attempts, including unsuccessful ordinary operations;
+it is not proof of real Wine semantics or a console performance gain.
+
+diff --git a/dlls/ntdll/unix/server.c b/dlls/ntdll/unix/server.c
+--- a/dlls/ntdll/unix/server.c
++++ b/dlls/ntdll/unix/server.c
+@@ -379,6 +379,11 @@
+  * Page pointers and slots are acquire/release atomic. Pages are never freed.
+  * fd_cache_mutex serializes every fill and all four close invalidations. */
+ #define PW_MUTEX_SLOT_CANDIDATE ((uintptr_t)3)
++/* First seven hook attempts use ordinary Wine semantics. The eighth may
++ * perform cold metadata lookup. All probation values retain low tag 3. */
++#define PW_MUTEX_ORDINARY_ATTEMPTS 7u
++#define PW_MUTEX_SLOT_CANDIDATE_READY (PW_MUTEX_SLOT_CANDIDATE + 4u * PW_MUTEX_ORDINARY_ATTEMPTS)
++_Static_assert( PW_MUTEX_SLOT_CANDIDATE_READY < 64, "candidate tags fit below aligned pointers" );
+ #define PW_MUTEX_CACHE_PAGES 128u
+ #define PW_MUTEX_CACHE_SLOTS (65536u / sizeof(uintptr_t))
+ static uintptr_t *shared_mutex_pages[PW_MUTEX_CACHE_PAGES];
+@@ -398,6 +403,11 @@
+         __atomic_store_n( &shared_mutex_pages[page], slots, __ATOMIC_RELEASE );
+     }
+     return slots ? &slots[index % PW_MUTEX_CACHE_SLOTS] : NULL;
++}
++
++static int shared_mutex_is_candidate( uintptr_t value )
++{
++    return (value & 3) == PW_MUTEX_SLOT_CANDIDATE;
+ }
+
+ /* Caller holds fd_cache_mutex with server signals blocked. Do not cache
+@@ -411,8 +421,11 @@
+     if (!pw_mutex_backend_ready( shared_mutex_backend ) ||
+         !(slot = shared_mutex_slot( handle, 0 ))) return 0;
+     value = __atomic_load_n( slot, __ATOMIC_ACQUIRE );
++    /* Creation/reuse may have reset probation before this cold lock was
++     * obtained. A new candidate must earn its own admission threshold. */
++    if (shared_mutex_is_candidate( value ) && value != PW_MUTEX_SLOT_CANDIDATE_READY) return 0;
+     if (!value || value == PW_MUTEX_SLOT_NEGATIVE ||
+-        (value != PW_MUTEX_SLOT_CANDIDATE && data->ps5_mutex_token)) return value;
++        (!shared_mutex_is_candidate( value ) && data->ps5_mutex_token)) return value;
+     ret = shared_mutex_backend->get_word( PW_MUTEX_BACKEND_VERSION, data->tid, inprocess_teb(),
+                                           handle, &word, &token, &access );
+     if (ret == PW_MUTEX_LOOKUP_NEGATIVE)
+@@ -442,7 +455,14 @@
+     slot = shared_mutex_slot( h, 0 );
+     value = slot ? __atomic_load_n( slot, __ATOMIC_ACQUIRE ) : 0;
+     if (!value || value == PW_MUTEX_SLOT_NEGATIVE) return STATUS_NOT_IMPLEMENTED;
+-    if (value == PW_MUTEX_SLOT_CANDIDATE || !data->ps5_mutex_token)
++    if (shared_mutex_is_candidate( value ) && value != PW_MUTEX_SLOT_CANDIDATE_READY)
++    {
++        /* One bounded CAS attempt; concurrent changes may delay admission.
++         * A failed CAS never overwrites close/reuse or an installed word. */
++        __atomic_compare_exchange_n( slot, &value, value + 4, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE );
++        return STATUS_NOT_IMPLEMENTED;
++    }
++    if (shared_mutex_is_candidate( value ) || !data->ps5_mutex_token)
+     {
+         server_enter_uninterrupted_section( &fd_cache_mutex, &sigset );
+         value = shared_mutex_fill( data, h );

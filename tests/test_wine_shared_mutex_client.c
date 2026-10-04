@@ -130,6 +130,23 @@ static void mark_candidate(HANDLE handle) {
     server_init_shared_mutex_slot(handle,1);
     server_leave_uninterrupted_section(&fd_cache_mutex,&set);
 }
+static unsigned admission_checks;
+static void observe_probation(HANDLE handle) {
+    uintptr_t *slot=shared_mutex_slot(handle,0);
+    assert(slot && __atomic_load_n(slot,__ATOMIC_ACQUIRE)==PW_MUTEX_SLOT_CANDIDATE);
+    unsigned calls=cold_calls,locks=sections,token=fixture_thread.ps5_mutex_token;
+    LARGE_INTEGER timeout={.QuadPart=0}; LONG previous=99;
+    for (unsigned i=0;i<PW_MUTEX_ORDINARY_ATTEMPTS;i++) {
+        assert(server_try_shared_mutex(handle,i&1,&timeout,&previous)==STATUS_NOT_IMPLEMENTED);
+        assert(__atomic_load_n(slot,__ATOMIC_ACQUIRE)==PW_MUTEX_SLOT_CANDIDATE+4u*(i+1));
+        assert(previous==99 && !timeout.QuadPart && fixture_thread.ps5_mutex_token==token);
+        assert(cold_calls==calls && sections==locks && !section_depth);
+        ++admission_checks;
+    }
+    assert(__atomic_load_n(slot,__ATOMIC_ACQUIRE)==PW_MUTEX_SLOT_CANDIDATE_READY);
+}
+static void prime_candidate(HANDLE handle) { mark_candidate(handle); observe_probation(handle); }
+
 static void expect_no_probe(HANDLE handle) {
     unsigned cold_before=cold_calls,sections_before=sections;
     for (unsigned i=0;i<100;i++) {
@@ -262,6 +279,61 @@ static void take_release(HANDLE handle) {
     assert(server_try_shared_mutex(handle,0,NULL,NULL)==STATUS_SUCCESS);
     assert(server_try_shared_mutex(handle,1,NULL,NULL)==STATUS_SUCCESS);
 }
+static pthread_barrier_t admission_barrier;
+static unsigned admission_counter;
+static void *admission_worker(void *arg) {
+    fixture_thread=(struct thread_data){.tid=(unsigned)(uintptr_t)arg};
+    int result=pthread_barrier_wait(&admission_barrier);
+    assert(!result || result==PTHREAD_BARRIER_SERIAL_THREAD);
+    for (unsigned i=0;i<64;i++) {
+        if (server_try_shared_mutex(1804,0,NULL,NULL)==STATUS_SUCCESS) {
+            ++admission_counter;
+            assert(server_try_shared_mutex(1804,1,NULL,NULL)==STATUS_SUCCESS);
+        }
+    }
+    return NULL;
+}
+static void test_admission(void) {
+    struct node *short_lived=node(1800,1,SYNCHRONIZE);
+    unsigned calls=cold_calls,locks=sections;
+    /* Ten ordinary close/create cycles with four hook attempts each must
+     * never perform metadata lookup or mutate a shared ownership word. */
+    for (unsigned cycle=0;cycle<10;cycle++) {
+        mark_candidate(1800); locks=sections;
+        LONG previous=99;
+        for (unsigned i=0;i<4;i++) {
+            assert(server_try_shared_mutex(1800,i&1,NULL,&previous)==STATUS_NOT_IMPLEMENTED);
+            assert(previous==99 && cold_calls==calls && sections==locks);
+            assert(!pw_mutex_word_load(&short_lived->word)); ++admission_checks;
+        }
+        assert(!pthread_mutex_lock(&fd_cache_mutex));
+        server_clear_shared_mutex_slot(1800);
+        assert(!pthread_mutex_unlock(&fd_cache_mutex));
+        assert(!__atomic_load_n(shared_mutex_slot(1800,0),__ATOMIC_ACQUIRE));
+    }
+    /* The actual cold fill must recheck creation's fresh probation marker,
+     * even when a caller observed a ready marker before taking the lock. */
+    prime_candidate(1800); calls=cold_calls;
+    sigset_t set; server_enter_uninterrupted_section(&fd_cache_mutex,&set);
+    server_init_shared_mutex_slot(1800,1);
+    assert(!shared_mutex_fill(get_thread_data(),1800));
+    assert(__atomic_load_n(shared_mutex_slot(1800,0),__ATOMIC_ACQUIRE)==PW_MUTEX_SLOT_CANDIDATE);
+    assert(cold_calls==calls); server_leave_uninterrupted_section(&fd_cache_mutex,&set); ++admission_checks;
+    observe_probation(1800); take_release(1800);
+    /* Concurrent admission never turns an integer tag into a word pointer
+     * and eventually installs one canonical cell for live threads. */
+    struct node *concurrent=node(1804,1,SYNCHRONIZE); mark_candidate(1804);
+    assert(!pthread_barrier_init(&admission_barrier,NULL,4));
+    pthread_t threads[4];
+    for (unsigned i=0;i<4;i++) assert(!pthread_create(&threads[i],NULL,admission_worker,(void *)(uintptr_t)(30+i)));
+    for (unsigned i=0;i<4;i++) assert(!pthread_join(threads[i],NULL));
+    assert(!pthread_barrier_destroy(&admission_barrier));
+    assert(admission_counter && !pw_mutex_word_load(&concurrent->word));
+    uintptr_t value=__atomic_load_n(shared_mutex_slot(1804,0),__ATOMIC_ACQUIRE);
+    assert(!shared_mutex_is_candidate(value) && pw_mutex_slot_word(value)==&concurrent->word);
+    ++admission_checks;
+}
+
 static unsigned protected_counter;
 static void *worker(void *arg) {
     fixture_thread=(struct thread_data){.tid=(unsigned)(uintptr_t)arg};
@@ -293,7 +365,7 @@ int main(int argc,char **argv) {
     expect_no_probe((HANDLE)-2); expect_no_probe(5556);
     expect_no_probe(4u*(PW_MUTEX_CACHE_PAGES*PW_MUTEX_CACHE_SLOTS+1u));
     test_creation();
-    unsigned first_sections=sections; mark_candidate(4);
+    unsigned first_sections=sections; prime_candidate(4);
     take_release(4); assert(fixture_thread.ps5_mutex_token==101 && cold_calls==1 && sections==first_sections+2);
     assert(global_error==7 && server_threads[1].error==9 && !server_threads[1].refs && !current);
     unsigned cold_before=cold_calls, sections_before=sections;
@@ -307,7 +379,7 @@ int main(int argc,char **argv) {
     assert(server_try_shared_mutex(4,1,NULL,&previous)==STATUS_SUCCESS && previous==0);
     /* Zero wait access cannot acquire, while release keeps Wine access 0. */
     struct node *without_access=node(8,1,0);
-    mark_candidate(8);
+    prime_candidate(8);
     assert(server_try_shared_mutex(8,0,NULL,NULL)==STATUS_NOT_IMPLEMENTED);
     assert(!pw_mutex_word_load(&without_access->word));
     assert(pw_mutex_word_try_acquire(&without_access->word,fixture_thread.ps5_mutex_token));
@@ -315,7 +387,7 @@ int main(int argc,char **argv) {
     /* Server-side reuse can turn a marked candidate into an event. More
      * than 64 such valid negatives retain independent exact slots. */
     for (unsigned i=0;i<80;i++) {
-        unsigned h=1000+4*i; node(h,0,0); mark_candidate(h);
+        unsigned h=1000+4*i; node(h,0,0); prime_candidate(h);
         assert(server_try_shared_mutex(h,0,NULL,NULL)==STATUS_NOT_IMPLEMENTED);
     }
     cold_before=cold_calls; sections_before=sections;
@@ -323,15 +395,15 @@ int main(int argc,char **argv) {
         assert(server_try_shared_mutex(1000+4*i,0,NULL,NULL)==STATUS_NOT_IMPLEMENTED);
     assert(cold_calls==cold_before && sections==sections_before);
     /* A reused negative becomes a candidate on eligible mutant creation. */
-    nodes[2].kind=1; nodes[2].access=SYNCHRONIZE; mark_candidate(1000); take_release(1000);
+    nodes[2].kind=1; nodes[2].access=SYNCHRONIZE; prime_candidate(1000); take_release(1000);
     /* A valid cold retry must not create a lasting negative. */
     struct node *retry=node(1400,1,SYNCHRONIZE); retry_once=1;
-    mark_candidate(1400);
+    prime_candidate(1400);
     assert(server_try_shared_mutex(1400,0,NULL,NULL)==STATUS_NOT_IMPLEMENTED);
-    assert(__atomic_load_n(shared_mutex_slot(1400,0),__ATOMIC_ACQUIRE)==PW_MUTEX_SLOT_CANDIDATE); take_release(1400);
+    assert(__atomic_load_n(shared_mutex_slot(1400,0),__ATOMIC_ACQUIRE)==PW_MUTEX_SLOT_CANDIDATE_READY); take_release(1400);
     assert(!pw_mutex_word_load(&retry->word));
     /* A second page is allocated only on candidate creation. */
-    unsigned high=4*(PW_MUTEX_CACHE_SLOTS+7)+4; node(high,1,SYNCHRONIZE); mark_candidate(high); take_release(high);
+    unsigned high=4*(PW_MUTEX_CACHE_SLOTS+7)+4; node(high,1,SYNCHRONIZE); prime_candidate(high); take_release(high);
     assert(page_count==1); cold_before=cold_calls; sections_before=sections; take_release(high);
     assert(cold_calls==cold_before && sections==sections_before);
     /* Readiness downgrade is a fallback with zero extra cold calls/locks. */
@@ -353,9 +425,10 @@ int main(int argc,char **argv) {
     uint64_t old; pw_mutex_word_freeze(&first->word,&old); first->handle=0;
     server_clear_shared_mutex_slot(4); struct node *replacement=node(4,1,SYNCHRONIZE);
     server_init_shared_mutex_slot(4,1);
-    assert(!pthread_mutex_unlock(&fd_cache_mutex)); take_release(4);
+    assert(!pthread_mutex_unlock(&fd_cache_mutex)); observe_probation(4); take_release(4);
     assert(pw_mutex_word_load(&first->word)&PW_MUTEX_WORD_SLOW);
     assert(!pw_mutex_word_load(&replacement->word));
+    test_admission();
     /* Legal concurrent ownership on the real client/CAS path. Each live
      * thread needs its own token even when another filled the shared slot. */
     pthread_t threads[4];
@@ -366,5 +439,6 @@ int main(int argc,char **argv) {
     for (unsigned i=0;i<256;i++) assert(!server_threads[i].refs);
     for (unsigned i=0;i<page_count;i++) free(pages[i]);
     printf("PASS: actual creation gate, unknown/pseudo/out-of-table immediate fallback, strict independent switches, 15 lookup gates, 24000 warm hits without cold calls/locks, 80 exact negatives, legal lifecycle, 12000 concurrent sections\n");
+    printf("PASS: %u admission checks, short-lived fallback, reuse recheck and concurrent canonical fill\n",admission_checks);
     return 0;
 }

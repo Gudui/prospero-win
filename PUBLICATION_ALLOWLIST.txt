@@ -346,3 +346,4 @@ tests/test_wine_shared_mutex_client.c
 tests/test_wine_shared_mutex_client.py
 wine/patches/0840-server-ps5-readonly-mutex-dump.patch
 wine/patches/0850-server-ps5-shared-mutex-retained-cap.patch
+wine/patches/0860-ntdll-ps5-shared-mutex-admission.patch

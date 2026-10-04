@@ -59,6 +59,8 @@ def apply_hunks(text, patch, file):
 def main():
     body = apply_hunks(additions(PATCH, 'dlls/ntdll/unix/server.c'),
                        CANDIDATES, 'dlls/ntdll/unix/server.c')
+    body = apply_hunks(body, ROOT / 'wine/patches/0860-ntdll-ps5-shared-mutex-admission.patch',
+                       'dlls/ntdll/unix/server.c')
     cache = body[body.index('/* Exact canonical handle table,'):]
     cache = cache[:cache.index('\n#endif')]
     cache += '\n' + function_body(body, 'int server_shared_mutex_enabled(')

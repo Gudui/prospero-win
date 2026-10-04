@@ -3,8 +3,8 @@
 Status: experimental Unix client/server source implemented and build-tested.
 Patch 0810 supplies server authority/lifetime hooks; 0820 adds the native ABI,
 client cache and default-off switch. Patch 0830 adds creation-time candidate
-selection. Native fixtures and SDK pair builds
-pass. Real Wine semantics, asynchronous thread/signal behavior and console
+selection; 0860 delays cold admission until repeated use. Native fixtures
+and SDK pair builds pass. Real Wine semantics, asynchronous thread/signal behavior and console
 performance remain unvalidated. The pair is held for source/runtime review;
 no hardware activation, PR or merge is approved by these source checks.
 
@@ -139,6 +139,19 @@ permanent negatives. A failed cache-page allocation leaves that handle on
 ordinary semantics. More than 64 marked candidates subsequently reused as
 valid events can retain independent negatives without modulo collisions.
 
+Patch 0860 encodes probation in that candidate slot. The first seven hook
+attempts use ordinary Wine operations without metadata probing, cache locking,
+signal-mask changes or cell allocation; the eighth observed ready marker may
+attempt activation. One atomic compare/exchange per probation attempt advances
+its bounded count. A losing race falls back and may delay admission, rather
+than spinning or overwriting an installed cell. This counts attempts, including
+unsuccessful operations, rather than proving successful ownership activity.
+Create/close reuse resets the counter. Cold fill rechecks the ready marker
+under the cache lock; a newly reused handle earns its own threshold. Transient
+metadata retries retain the ready marker. Positive cached words do not pay a
+probation counter update. The seven-attempt threshold is experimental and
+requires console measurement alongside the lifetime allocation cap.
+
 All fills and their second lookups happen under `fd_cache_mutex`, with the
 existing uninterrupted-section machinery. Invalidation sits beside all
 four `close_inproc_sync` calls: ordinary close, duplicate-close-source,
@@ -271,6 +284,15 @@ release, a second page, readiness downgrade, temporary SLOW recovery, ordinary c
 ASan/UBSan runs pass. These callbacks do not model the complete Wine server,
 its signals or exception delivery; they do not measure the WoW64 entry or
 establish a console speedup.
+
+The native client fixture also applies 0860 to the exact client bodies.
+It checks every probation step and caller-output preservation before existing
+activation cases, with 658 admission checks. Ten short-lived modeled
+close/create cycles perform no
+metadata lookups. A ready-marker/creation-reset ordering checks the cold
+recheck, and four live native threads exercise concurrent admission into one
+canonical cell. These hook fixtures do not execute ordinary Wine fallback or
+establish asynchronous lifecycle safety or a hardware performance gain.
 
 The 0830 SDK revision retains the unchanged server member of the matching
 pair and rebuilds every ntdll C unit against consistent private headers.
