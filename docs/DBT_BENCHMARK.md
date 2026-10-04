@@ -54,6 +54,22 @@ tools/bench_7zip.sh --config wowprospero --wine <wine> --prefix <prefix> --modes
 The `wowprospero` prefix needs `wowprospero.dll` installed
 (`docs/WINE_INTEGRATION.md`).
 
+## Dispatcher lookup reuse
+
+When an unlinked exit resolves its target in the current dispatcher call,
+the dispatcher reuses that entry rather than looking it up again. The source
+entry is also looked up once for both the FP link check and reconciliation.
+These pointers stay local to one call; the engine's single-dispatcher and
+cache-reset rules still apply. Mixed native-FP backends still return through
+C, with the existing FP conversions and link rejection.
+
+`test_pw_x86_dispatch_reuse` runs bounded integer and SSE/x87 arithmetic,
+checks registers and flags, and covers cold/warm execution and code changes
+across three cache generations with FP and chaining enabled or disabled.
+Its 141 mixed crossings require at most two cache lookups, compared with
+three on the previous engine. This is a lookup-count result; console frame
+rates and full gameplay regression gates need separate validation.
+
 ## First results (2026-09-27)
 
 The starting point, before the re-encoder and the changes below.

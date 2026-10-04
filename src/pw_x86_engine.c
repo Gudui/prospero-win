@@ -599,6 +599,7 @@ int pw_x86_engine_step(PwX86Engine *engine,PwX86State *state,PwX86StepReport *re
 {
     if(!engine || !state || !report || !engine->initialized)return PW_ERR_PRECONDITION;
     memset(report,0,sizeof(*report));report->guest_pc=state->eip;
+    const PwX86CacheEntry *entry=NULL;
     if(engine->dispatch_profile && engine->chain_targets) {
         const PwX86IndirectTarget *target=&engine->chain_targets[pw_x86_chain_slot(state->eip)];
         const PwX86IndirectTarget *second=target+PW_X86_REENCODE_CHAIN_SLOTS;
@@ -614,14 +615,18 @@ int pw_x86_engine_step(PwX86Engine *engine,PwX86State *state,PwX86StepReport *re
         if(last_slot->target_pc == state->eip && !last_slot->is_linked) {
             PwX86CacheEntry *target_entry = NULL;
             if(pw_x86_cache_lookup_mut(&engine->cache, state->eip, &target_entry) == PW_OK) {
+                /* This single-dispatcher call neither publishes nor resets
+                 * the cache while resolving a link. Keep the target even
+                 * when the FP contracts require returning through C. */
+                entry = target_entry;
                 PwX86CacheEntry *source_entry = NULL;
+                int source_status = pw_x86_cache_lookup_mut(&engine->cache, last_slot->source_pc, &source_entry);
                 if(engine->native_fp &&
-                   (pw_x86_cache_lookup_mut(&engine->cache, last_slot->source_pc, &source_entry) != PW_OK ||
+                   (source_status != PW_OK ||
                     !may_link(engine, &source_entry->exit_contract, &target_entry->entry_contract)))
                     goto dispatch;
-                source_entry = NULL;
                 size_t reconcile_offset = 0;
-                if(pw_x86_cache_lookup_mut(&engine->cache, last_slot->source_pc, &source_entry) == PW_OK) {
+                if(source_status == PW_OK) {
                     if(last_slot == &source_entry->link_slots[0]) {
                         reconcile_offset = source_entry->exit.target_reconcile_offset;
                     } else if(last_slot == &source_entry->link_slots[1]) {
@@ -652,8 +657,7 @@ int pw_x86_engine_step(PwX86Engine *engine,PwX86State *state,PwX86StepReport *re
     }
 
 dispatch:;
-    const PwX86CacheEntry *entry=NULL;
-    int status=pw_x86_cache_lookup(&engine->cache,state->eip,&entry);
+    int status=entry ? PW_OK : pw_x86_cache_lookup(&engine->cache,state->eip,&entry);
     if(status==PW_OK)report->cache_hit=1;
     else if(status==PW_ERR_NOT_FOUND) {
         status=compile(engine,state->eip,&entry);
