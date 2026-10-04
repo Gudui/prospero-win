@@ -1018,3 +1018,23 @@ flags for every faulting memory instruction.
 
 Periodic translated-run percentages describe wall-time attribution. They
 do not measure thread CPU utilization or the number of cores freed.
+
+## FS memory pushes, byte-table lookup and direction flags
+
+Both translators take 32-bit memory pushes with an FS override, including
+absolute, base/displacement and SIB operands. FS applies to the source read;
+the destination stays on the ordinary guest stack. The source address uses
+the original ESP, and a refused source or stack access leaves ESP unchanged.
+
+XLAT uses the unsigned byte in AL to index the table at EBX (plus the guest
+FS base when present), updates only AL, and preserves flags. STD and CLD
+update the guest DF bit in state. The host DF stays clear outside the native
+string instruction so returns to C obey the host ABI; string operations use
+the guest direction and clear host DF again afterwards.
+
+Tests compare FS pushes with the existing native fallback and XLAT with the
+native instruction, check register preservation, byte indices, flags, guarded
+faults, marked accesses and warm-cache reuse. The older emitter also runs the
+cases in all residency/lazy-flag combinations. These checks establish host
+correctness and coverage; a console comparison of the same workload is
+required to establish a game performance benefit.
