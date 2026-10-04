@@ -344,3 +344,4 @@ wine/patches/0830-ntdll-ps5-shared-mutex-candidates.patch
 tests/fixtures/wine_mutant_create.c
 tests/test_wine_shared_mutex_client.c
 tests/test_wine_shared_mutex_client.py
+wine/patches/0840-server-ps5-readonly-mutex-dump.patch

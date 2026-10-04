@@ -56,12 +56,31 @@ def added_metadata_policy():
     raise AssertionError("unterminated metadata policy")
 
 
+def reconstructed_dump():
+    # Complete public Wine function retained as context plus the single 0810
+    # addition. Require the exact old function before reconstructing 0840.
+    text = PATCH.read_text()
+    start = text.index("\n static void mutex_sync_dump( struct object *obj, int verbose )\n {")
+    end = text.index("\n@@ ", start)
+    body = "\n".join(line[1:] for line in text[start:end].splitlines()
+                     if line.startswith((" ", "+"))) + "\n"
+    patch = (ROOT / "wine/patches/0840-server-ps5-readonly-mutex-dump.patch").read_text()
+    assert patch.count("@@ ") == 1
+    assert patch.count("diff --git a/server/mutex.c b/server/mutex.c") == 1
+    hunk = patch[patch.index("@@ "):].splitlines()[1:]
+    before = "\n".join(line[1:] for line in hunk if line.startswith((" ", "-")))
+    after = "\n".join(line[1:] for line in hunk if line.startswith((" ", "+")))
+    assert body.rstrip() == before.rstrip()
+    return after.rstrip() + "\n"
+
+
 def main():
     with tempfile.TemporaryDirectory(prefix="pw-shared-mutex-word-") as temp:
         folder = Path(temp)
         (folder / "ps5_mutex_word.h").write_text(added_header())
         (folder / "ps5_mutex_backend.h").write_text(client_addition("include/wine/ps5_mutex_backend.h"))
         (folder / "ps5_mutex_server.inc").write_text(added_server_helpers() + added_metadata_policy())
+        (folder / "ps5_mutex_dump.inc").write_text(reconstructed_dump())
         binary = folder / "test"
         command = shlex.split(os.environ.get("CC", "cc"))
         command += shlex.split(os.environ.get("CFLAGS", "-O2 -g -Wall -Wextra -Werror"))
@@ -70,6 +89,7 @@ def main():
         subprocess.run(command, check=True)
         subprocess.run([str(binary)], check=True, timeout=60)
         server_command = command.copy()
+        server_command += ["-DWINE_INPROCESS_SERVER"]
         server_command[server_command.index(str(ROOT / "tests/test_wine_shared_mutex_word.c"))] = str(
             ROOT / "tests/test_wine_shared_mutex_server.c")
         subprocess.run(server_command, check=True)

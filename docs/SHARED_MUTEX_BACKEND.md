@@ -154,6 +154,19 @@ hits also do not refresh the legacy last-server-request watchdog timestamp.
 With that diagnostic enabled, its elapsed-request age cannot establish
 whether a thread was idle or executing shared hits.
 
+## Diagnostic snapshots
+
+Patch 0840 makes the mutex dump observational. With a published shared
+word, it reads count and opaque owner token from one atomic snapshot,
+labelled `shared snapshot`. Another client may change that word immediately
+afterward. With SLOW, inactive or retired state it prints the legacy count
+and owner pointer under the server lock. It does not set SLOW, adopt an
+owner, change references or queue publication. Native checks compile the
+actual patched dump and verify 4,775 outputs with unchanged state through
+ordinary ownership transfers, recursion, retirement and inactive legacy
+ownership.
+This does not establish runtime integration or a console performance gain.
+
 ## Entry cost
 
 A Unix ntdll hit can remove request marshalling, global server locking,

@@ -1,0 +1,38 @@
+From: Prospero Win contributors <prospero-win@localhost>
+Subject: [PATCH] server: observe mutex dumps without transferring ownership
+
+Depends on 0810 and applies after the shared-client series. Diagnostic
+printing must not set SLOW, adopt a client owner or queue publication.
+Print count and opaque owner token from a single atomic snapshot while
+published; retain legacy output for SLOW, inactive and retired objects.
+The server lock protects metadata. This is observational output, not a
+synchronized query or evidence of a console performance improvement.
+
+diff --git a/server/mutex.c b/server/mutex.c
+--- a/server/mutex.c
++++ b/server/mutex.c
+@@ -285,8 +285,23 @@
+ static void mutex_sync_dump( struct object *obj, int verbose )
+ {
+     struct mutex_sync *mutex = (struct mutex_sync *)obj;
++    (void)verbose;
+     assert( obj->ops == &mutex_sync_ops );
+-    ps5_mutex_enter_slow( mutex );
++#ifdef WINE_INPROCESS_SERVER
++    if (mutex->fast)
++    {
++        /* The server lock protects the cell pointer and legacy fields.
++         * Clients may change a published word: print one atomic snapshot,
++         * without adopting ownership or changing its mode for diagnostics. */
++        uint64_t word = pw_mutex_word_load( &mutex->fast->word );
++        if (!(word & PW_MUTEX_WORD_SLOW))
++        {
++            fprintf( stderr, "Mutex count=%u owner_token=%u (shared snapshot)\n",
++                     pw_mutex_word_count( word ), pw_mutex_word_owner( word ) );
++            return;
++        }
++    }
++#endif
+     fprintf( stderr, "Mutex count=%u owner=%p\n", mutex->count, mutex->owner );
+ }
+ 

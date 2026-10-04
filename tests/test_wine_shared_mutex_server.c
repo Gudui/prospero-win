@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdarg.h>
 
 struct list { struct list *next, *prev; };
 #define LIST_INIT(n) { &(n), &(n) }
@@ -63,7 +64,49 @@ static void legacy_release(struct mutex_sync *m,struct thread *t) {
 }
 #include "ps5_mutex_server.inc"
 
+/* Compile the exact patched dump; only its output destination is a native
+ * bounded callback so we can assert contents without noisy diagnostics. */
+static char dump_text[160];
+static unsigned dump_writes, dump_checks;
+static int fixture_dump_printf(FILE *stream,const char *format,...) {
+    va_list args; assert(stream==stderr); ++dump_writes;
+    va_start(args,format);
+    int result=vsnprintf(dump_text,sizeof(dump_text),format,args);
+    va_end(args); assert(result>=0 && (size_t)result<sizeof(dump_text)); return result;
+}
+#define fprintf fixture_dump_printf
+#include "ps5_mutex_dump.inc"
+#undef fprintf
+
+static void check_dump(struct mutex_sync *m,struct thread *t) {
+    struct mutex_sync before;
+    struct ps5_mutex_cell cell_before;
+    struct thread thread_before;
+    struct process process_before;
+    struct list active_before=ps5_mutex_active,pending_before=ps5_mutex_pending;
+    unsigned depth=ps5_mutex_operation_depth,writes=dump_writes;
+    uint64_t word=m->fast ? pw_mutex_word_load(&m->fast->word) : PW_MUTEX_WORD_SLOW;
+    char expected[sizeof(dump_text)];
+    memcpy(&before,m,sizeof(before)); memcpy(&thread_before,t,sizeof(thread_before));
+    memcpy(&process_before,t->process,sizeof(process_before));
+    if (m->fast) memcpy(&cell_before,m->fast,sizeof(cell_before));
+    if (!(word & PW_MUTEX_WORD_SLOW))
+        snprintf(expected,sizeof(expected),"Mutex count=%u owner_token=%u (shared snapshot)\n",
+                 pw_mutex_word_count(word),pw_mutex_word_owner(word));
+    else snprintf(expected,sizeof(expected),"Mutex count=%u owner=%p\n",m->count,(void *)m->owner);
+    mutex_sync_dump(&m->obj,1);
+    assert(dump_writes==writes+1 && !strcmp(dump_text,expected));
+    assert(!memcmp(&before,m,sizeof(before)));
+    assert(!memcmp(&thread_before,t,sizeof(thread_before)));
+    assert(!memcmp(&process_before,t->process,sizeof(process_before)));
+    if (m->fast) assert(!memcmp(&cell_before,m->fast,sizeof(cell_before)));
+    assert(!memcmp(&active_before,&ps5_mutex_active,sizeof(active_before)));
+    assert(!memcmp(&pending_before,&ps5_mutex_pending,sizeof(pending_before)));
+    assert(depth==ps5_mutex_operation_depth); ++dump_checks;
+}
+
 static void observe(struct mutex_sync *m,struct thread *t,unsigned expected) {
+    check_dump(m,t);
     uint64_t w=pw_mutex_word_load(&m->fast->word);
     if (w & PW_MUTEX_WORD_SLOW) {
         assert(m->count==expected && m->owner==(expected ? t : NULL));
@@ -170,6 +213,7 @@ static void test_metadata_policy(void) {
     expect_metadata_rejection(&a,4,PW_MUTEX_LOOKUP_NEGATIVE);
     assert(p.obj.refcount==1 && m.obj.refcount==1);
     free(cell); handle_object=NULL; /* No fixture reader remains. */
+    check_dump(&m,&a);
     assert(metadata_checks==14 && !ps5_mutex_operation_depth);
 }
 
@@ -182,6 +226,7 @@ int main(void) {
     list_init(&p.thread_list); list_init(&a.mutex_list); list_init(&b.mutex_list);
     list_add_tail(&p.thread_list,&a.proc_entry); list_add_tail(&p.thread_list,&b.proc_entry);
     list_init(&m.obj.wait_queue); handle_object=&wrapper; fixture_access=0x100000;
+    check_dump(&m,&a); /* Inactive legacy object. */
     /* Ineligible cold metadata must leave state and output storage alone. */
     wrapper.obj.name=&p; assert(!ps5_get_mutex_word(&a,4,&word,&token,&access));
     assert(!word && !m.fast && p.obj.refcount==1); wrapper.obj.name=NULL;
@@ -232,6 +277,7 @@ int main(void) {
     ps5_mutex_server_end(); assert(!m.fast && m.fast_disabled && !wrapper.fast_eligible);
     assert(pw_mutex_word_load(word)&PW_MUTEX_WORD_SLOW);
     assert(m.owner==&a && m.count==1 && m.obj.refcount==2 && p.obj.refcount==1);
+    check_dump(&m,&a); /* Retired but still owned. */
     assert(!ps5_get_mutex_word(&a,4,&word,&token,&access));
     release_object(&m); assert(m.obj.refcount==1); legacy_release(&m,&a); assert(!m.obj.refcount);
     assert(list_empty(&ps5_mutex_active) && list_empty(&ps5_mutex_pending)); checked++;
@@ -260,6 +306,7 @@ int main(void) {
     struct mutex owned_wrapper={.obj={.refcount=1,.handle_count=1,.ops=&mutex_ops},
         .sync=&owned.obj,.fast_eligible=1};
     list_init(&owned.obj.wait_queue); do_grab(&owned,&b); handle_object=&owned_wrapper;
+    check_dump(&owned,&b); /* Legacy owned before activation. */
     ps5_mutex_server_begin(); assert(ps5_get_mutex_word(&a,4,&word,&token,&access));
     ps5_mutex_server_end(); observe(&owned,&b,1); checked++;
     struct ps5_mutex_cell *owned_cell=owned.fast;
@@ -272,5 +319,6 @@ int main(void) {
     test_metadata_policy();
     printf("PASS: %u actual server-helper observations, queued/nested recovery, retirement\n",checked);
     printf("PASS: %u actual server metadata policy cases, retry/negative/ready distinctions\n",metadata_checks);
+    printf("PASS: %u read-only dump snapshots with unchanged ownership, lists and references\n",dump_checks);
     return 0;
 }
