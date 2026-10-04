@@ -303,6 +303,10 @@ pipes again. An older `wineserver.prx` without the export works with the new
 `ntdll.prx` and vice versa, so swapping one module is enough to compare the
 two paths.
 
+[Ordinary 32-bit mutex validation](WINE_MUTEX_VALIDATION.md) provides a
+standalone fixture for paired runtime regression checks. Its results stay
+separate from full lifecycle validation and console performance gates.
+
 ## User driver
 
 A title has no explorer, no display server and no driver dll, so patch 0400

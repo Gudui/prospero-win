@@ -297,6 +297,9 @@ wine/ps5/pw_opengl_libc.c
 wine/ps5/pw_vulkan_libc.c
 wine/ps5/pw_vulkan_radv.c
 docs/INSTALLING_GAMES.md
+docs/WINE_MUTEX_VALIDATION.md
+tools/build_wine_mutex_ordinary.py
+tests/fixtures/wine_mutex_ordinary.c
 docs/GETTING_STARTED.md
 docs/CONTROLS.md
 tests/test_pw_install.py
