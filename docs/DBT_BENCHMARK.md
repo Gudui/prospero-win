@@ -998,3 +998,13 @@ generations, and executes the original cached block after each refusal. It also
 checks that a successful reset clears the sealed state before recompilation.
 These are synthetic allocation/correctness results, not PS5 memory or performance
 measurement. Console census and regression checks remain pending.
+
+## Refused bit-count reads
+
+The re-encoder keeps the original EIP, GPRs and arithmetic flags when a
+TZCNT/LZCNT memory guard refuses the source read. The instruction has not
+completed at that point. Regression checks cover 16- and 32-bit operands,
+with and without FS, and require a read fault at the effective address.
+
+Periodic translated-run percentages describe wall-time attribution. They
+do not measure thread CPU utilization or the number of cores freed.
