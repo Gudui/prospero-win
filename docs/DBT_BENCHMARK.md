@@ -1038,3 +1038,9 @@ faults, marked accesses and warm-cache reuse. The older emitter also runs the
 cases in all residency/lazy-flag combinations. These checks establish host
 correctness and coverage; a console comparison of the same workload is
 required to establish a game performance benefit.
+
+Native-fault checks also exercise refused FS source reads, FS-push stack
+writes and flat/FS XLAT reads with guest DF set, both with and without the
+host call stack. Marker recovery must match the guarded EIP, registers,
+arithmetic flags and access metadata, preserve guest DF, and leave host DF
+clear when control returns to C.
