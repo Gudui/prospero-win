@@ -253,6 +253,73 @@ static void pseudo_timeout(void)
     check("current_process_timeout", WaitForSingleObject(GetCurrentProcess(), 0), WAIT_TIMEOUT);
 }
 
+static DWORD WINAPI owning_worker(void *argument)
+{
+    struct handoff *handoff = argument;
+    if (WaitForSingleObject(handoff->mutex, 5000) != WAIT_OBJECT_0) return 20;
+    BOOL notified = SetEvent(handoff->ready);
+    DWORD waited = WaitForSingleObject(handoff->release, 5000);
+    /* Ordinary thread return abandons ownership; no explicit release. */
+    return notified && waited == WAIT_OBJECT_0 ? 0 : 21;
+}
+static void normal_exit_abandonment(void)
+{
+    begin_case("normal_exit_abandonment");
+    static struct handoff handoff;
+    handoff.mutex = mutex();
+    handoff.ready = CreateEventW(NULL, TRUE, FALSE, NULL);
+    handoff.release = CreateEventW(NULL, TRUE, FALSE, NULL);
+    HANDLE thread = NULL;
+    BOOL joined = TRUE;
+    if (valid("abandon_mutex", handoff.mutex) && valid("abandon_ready", handoff.ready) &&
+        valid("abandon_release", handoff.release))
+    {
+        /* Exercise warm ownership before the other thread becomes owner. */
+        for (unsigned i = 0; i < 8; ++i) take_release(handoff.mutex);
+        thread = CreateThread(NULL, 0, owning_worker, &handoff, 0, NULL);
+        if (valid("abandon_thread", thread))
+        {
+            DWORD ready = WaitForSingleObject(handoff.ready, 5000);
+            check("abandon_worker_ready", ready, WAIT_OBJECT_0);
+            if (ready == WAIT_OBJECT_0)
+            {
+                DWORD ret = WaitForSingleObject(handoff.mutex, 0);
+                check("abandon_live_owner_timeout", ret, WAIT_TIMEOUT);
+                if (ret == WAIT_OBJECT_0 || ret == WAIT_ABANDONED_0)
+                    check("abandon_unexpected_take_release", ReleaseMutex(handoff.mutex), TRUE);
+            }
+            check("allow_owning_worker_return", SetEvent(handoff.release), TRUE);
+            DWORD wait = WaitForSingleObject(thread, 10000), code = 99;
+            check("abandon_worker_join", wait, WAIT_OBJECT_0);
+            joined = wait == WAIT_OBJECT_0;
+            if (joined)
+            {
+                check("abandon_exit_query", GetExitCodeThread(thread, &code), TRUE);
+                check("abandon_exit_code", code, 0);
+                if (ready == WAIT_OBJECT_0 && code == 0)
+                {
+                    DWORD ret = WaitForSingleObject(handoff.mutex, 5000);
+                    check("abandon_transfer", ret, WAIT_ABANDONED_0);
+                    if (ret == WAIT_OBJECT_0 || ret == WAIT_ABANDONED_0)
+                    {
+                        DWORD recursive = WaitForSingleObject(handoff.mutex, 0);
+                        check("abandon_recursive_take", recursive, WAIT_OBJECT_0);
+                        if (recursive == WAIT_OBJECT_0)
+                            check("abandon_release_recursive", ReleaseMutex(handoff.mutex), TRUE);
+                        check("abandon_release_transferred", ReleaseMutex(handoff.mutex), TRUE);
+                        take_release(handoff.mutex);
+                    }
+                }
+            }
+        }
+    }
+    /* Static caller storage and worker handles survive an unexpected failed join. */
+    if (joined)
+    {
+        close_handle(thread); close_handle(handoff.release); close_handle(handoff.ready); close_handle(handoff.mutex);
+    }
+}
+
 void WINAPI mainCRTStartup(void)
 {
     report_file = CreateFileW(L"pw-mutex-ordinary.log", GENERIC_WRITE, FILE_SHARE_READ, NULL,
@@ -265,8 +332,9 @@ void WINAPI mainCRTStartup(void)
     {
         recursion(); ordinary_objects(); multiwait(); signal_wait(); alertable_owned();
         named_inherited(); duplicate(); close_reuse(); contended_handoff(); pseudo_timeout();
+        normal_exit_abandonment();
     }
-    check("case_count", cases, 10);
+    check("case_count", cases, 11);
     line.used = 0;
     text(&line, "PW_MUTEX_ORDINARY done cases="); hex(&line, cases);
     text(&line, " checks="); hex(&line, checks);

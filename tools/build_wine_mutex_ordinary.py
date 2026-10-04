@@ -61,7 +61,7 @@ def main():
         'artifact': str(exe), 'sha256': hashlib.sha256(data).hexdigest(),
         'compiler_version': subprocess.check_output([compiler, '--version'], text=True).splitlines()[0],
         'command': command, 'machine': machine, 'optional_header_magic': magic,
-        'subsystem': subsystem, 'imports': dlls, 'case_groups': 10,
+        'subsystem': subsystem, 'imports': dlls, 'case_groups': 11,
         'entry_rva': entry, 'entry_in_executable_section': entry_is_executable,
         'runtime_executed': False,
         'scope': 'Compilation, PE32 header and kernel32-only import checks. No semantic/runtime acceptance.',
