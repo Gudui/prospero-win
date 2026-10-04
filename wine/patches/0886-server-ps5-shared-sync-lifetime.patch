@@ -1,14 +1,16 @@
 From: Prospero Win contributors <prospero-win@localhost>
-Subject: [PATCH] server: prepare event/semaphore authority and lifetime hooks
+Subject: [PATCH] server: prepare bounded event/semaphore authority and lifetime hooks
 
 Freeze shared state before ordinary operations and publish only after the
 outermost request with no waiters. Retire permanently on handle alias/close
-or backend disable. Depends on 0885; no native ABI or client activates it yet.
+or backend disable. Retained cell payload has a one-MiB lifetime budget;
+full-budget objects use ordinary Wine without recurring allocation attempts.
+Depends on 0885; no native ABI or client activates it yet.
 
 diff --git a/server/event.c b/server/event.c
 --- a/server/event.c
 +++ b/server/event.c
-@@ -34,6 +34,113 @@
+@@ -34,6 +34,125 @@
  #include "thread.h"
  #include "request.h"
  #include "security.h"
@@ -23,6 +25,12 @@ diff --git a/server/event.c b/server/event.c
 +static struct list ps5_sync_active = LIST_INIT(ps5_sync_active);
 +static struct list ps5_sync_pending = LIST_INIT(ps5_sync_pending);
 +static unsigned int ps5_sync_operation_depth;
++/* Lifetime budget counts successful allocations, including retired cells.
++ * Retired pointers can remain cached, so storage is never freed or reused.
++ * Requested payload is bounded; allocator metadata is not part of this cap. */
++#define PW_SYNC_RETAINED_PAYLOAD_BYTES (1024u * 1024u)
++#define PW_SYNC_RETAINED_CELL_LIMIT (PW_SYNC_RETAINED_PAYLOAD_BYTES / sizeof(struct ps5_sync_cell))
++static unsigned int ps5_sync_retained_cells;
 +
 +static void ps5_sync_queue_publish(struct ps5_sync_cell *cell)
 +{
@@ -49,7 +57,13 @@ diff --git a/server/event.c b/server/event.c
 +    void *storage;
 +    if (*disabled) return NULL;
 +    if ((cell = *binding)) return cell;
++    if (ps5_sync_retained_cells >= PW_SYNC_RETAINED_CELL_LIMIT)
++    {
++        *disabled = 1; /* Permanent ordinary fallback; do not retry a full budget. */
++        return NULL;
++    }
 +    if (posix_memalign(&storage, 64, sizeof(*cell))) return NULL;
++    ++ps5_sync_retained_cells;
 +    cell = storage;
 +    memset(cell, 0, sizeof(*cell));
 +    pw_sync_word_init(&cell->word, kind, read_value(sync), maximum);
@@ -122,7 +136,7 @@ diff --git a/server/event.c b/server/event.c
  
  static const WCHAR event_name[] = {'E','v','e','n','t'};
  
-@@ -54,6 +161,10 @@
+@@ -54,6 +173,10 @@
      struct object  obj;             /* object header */
      unsigned int   manual : 1;      /* is it a manual reset event? */
      unsigned int   signaled : 1;    /* event has been signaled */
@@ -133,7 +147,7 @@ diff --git a/server/event.c b/server/event.c
  };
  
  static void event_sync_dump( struct object *obj, int verbose );
-@@ -61,13 +172,35 @@
+@@ -61,13 +184,35 @@
  static void event_sync_satisfied( struct object *obj, struct wait_queue_entry *entry );
  static int event_sync_signal( struct object *obj, unsigned int access, int signal );
  
@@ -169,7 +183,7 @@ diff --git a/server/event.c b/server/event.c
      .signaled     = event_sync_signaled,
      .satisfied    = event_sync_satisfied,
      .signal       = event_sync_signal,
-@@ -82,6 +215,10 @@
+@@ -82,6 +227,10 @@
      if (!(event = alloc_object( &event_sync_ops ))) return NULL;
      event->manual   = manual;
      event->signaled = signaled;
@@ -180,7 +194,7 @@ diff --git a/server/event.c b/server/event.c
  
      return &event->obj;
  }
-@@ -93,6 +230,10 @@
+@@ -93,6 +242,10 @@
      if (!(event = alloc_object( &event_sync_ops ))) return NULL;
      event->manual   = manual;
      event->signaled = signaled;
@@ -191,7 +205,7 @@ diff --git a/server/event.c b/server/event.c
  
      return event;
  }
-@@ -107,6 +248,7 @@
+@@ -107,6 +260,7 @@
  {
      struct event_sync *event = (struct event_sync *)obj;
      assert( obj->ops == &event_sync_ops );
@@ -199,7 +213,7 @@ diff --git a/server/event.c b/server/event.c
      fprintf( stderr, "Event manual=%d signaled=%d\n",
               event->manual, event->signaled );
  }
-@@ -115,6 +257,7 @@
+@@ -115,6 +269,7 @@
  {
      struct event_sync *event = (struct event_sync *)obj;
      assert( obj->ops == &event_sync_ops );
@@ -207,7 +221,7 @@ diff --git a/server/event.c b/server/event.c
      return event->signaled;
  }
  
-@@ -122,6 +265,7 @@
+@@ -122,6 +277,7 @@
  {
      struct event_sync *event = (struct event_sync *)obj;
      assert( obj->ops == &event_sync_ops );
@@ -215,7 +229,7 @@ diff --git a/server/event.c b/server/event.c
      /* Reset if it's an auto-reset event */
      if (!event->manual) event->signaled = 0;
  }
-@@ -130,6 +274,7 @@
+@@ -130,6 +286,7 @@
  {
      struct event_sync *event = (struct event_sync *)obj;
      assert( obj->ops == &event_sync_ops );
@@ -223,7 +237,7 @@ diff --git a/server/event.c b/server/event.c
  
      /* wake up all waiters if manual reset, a single one otherwise */
      if ((event->signaled = !!signal)) wake_up( &event->obj, !event->manual );
-@@ -141,12 +286,18 @@
+@@ -141,12 +298,18 @@
      struct object      obj;             /* object header */
      struct object     *sync;            /* event sync object */
      struct list        kernel_object;   /* list of kernel object pointers */
@@ -242,7 +256,7 @@ diff --git a/server/event.c b/server/event.c
  };
  
  static void event_dump( struct object *obj, int verbose );
-@@ -155,6 +306,9 @@
+@@ -155,6 +318,9 @@
  static int event_signal( struct object *obj, unsigned int access, int signal );
  static struct list *event_get_kernel_obj_list( struct object *obj );
  static void event_destroy( struct object *obj );
@@ -252,7 +266,7 @@ diff --git a/server/event.c b/server/event.c
  
  static const struct object_ops event_ops =
  {
-@@ -166,6 +320,9 @@
+@@ -166,6 +332,9 @@
      .get_sync            = event_get_sync,
      .get_kernel_obj_list = event_get_kernel_obj_list,
      .destroy             = event_destroy,
@@ -262,7 +276,7 @@ diff --git a/server/event.c b/server/event.c
  };
  
  
-@@ -241,6 +398,9 @@
+@@ -241,6 +410,9 @@
      const struct event_init_data *data = init_data;
  
      list_init( &event->kernel_object );
@@ -272,7 +286,7 @@ diff --git a/server/event.c b/server/event.c
      return !!(event->sync = create_event_sync( data->manual_reset, data->initial_state ));
  }
  
-@@ -271,6 +431,9 @@
+@@ -271,6 +443,9 @@
  static struct list *event_get_kernel_obj_list( struct object *obj )
  {
      struct event *event = (struct event *)obj;
@@ -282,7 +296,7 @@ diff --git a/server/event.c b/server/event.c
      return &event->kernel_object;
  }
  
-@@ -279,8 +442,68 @@
+@@ -279,8 +454,68 @@
      struct event *event = (struct event *)obj;
      assert( obj->ops == &event_ops );
  
@@ -343,7 +357,7 @@ diff --git a/server/event.c b/server/event.c
 +    cell = ps5_sync_prepare(&sync->obj, &sync->fast, &sync->fast_disabled,
 +        sync->manual ? PW_SYNC_MANUAL_EVENT : PW_SYNC_AUTO_EVENT, 1,
 +        ps5_event_read_value, ps5_event_adopt_value);
-+    if (!cell) return -1;
++    if (!cell) return sync->fast_disabled ? 0 : -1;
 +    *word = &cell->word;
 +    return 1;
 +}
@@ -351,7 +365,7 @@ diff --git a/server/event.c b/server/event.c
  
  struct keyed_event *create_keyed_event( struct object *root, struct unicode_str name,
                                          unsigned int attr, const struct security_descriptor *sd )
-@@ -337,6 +560,9 @@
+@@ -337,6 +572,9 @@
      struct object_params params = { .ops = &event_ops, .access = req->access, .init_data = &data };
  
      if (!get_req_object_attributes( &params )) return;
@@ -361,7 +375,7 @@ diff --git a/server/event.c b/server/event.c
      reply->handle = create_named_obj_handle( current->process, &params );
      if (params.root) release_object( params.root );
  }
-@@ -357,6 +583,7 @@
+@@ -357,6 +595,7 @@
      if (!(event = get_event_obj( current->process, req->handle, EVENT_MODIFY_STATE ))) return;
      assert( event->sync->ops == &event_sync_ops ); /* never called with inproc syncs */
      sync = (struct event_sync *)event->sync;
@@ -369,7 +383,7 @@ diff --git a/server/event.c b/server/event.c
  
      reply->state = sync->signaled;
      switch(req->op)
-@@ -387,6 +614,7 @@
+@@ -387,6 +626,7 @@
      if (!(event = get_event_obj( current->process, req->handle, EVENT_QUERY_STATE ))) return;
      assert( event->sync->ops == &event_sync_ops ); /* never called with inproc syncs */
      sync = (struct event_sync *)event->sync;
@@ -572,7 +586,7 @@ diff --git a/server/semaphore.c b/server/semaphore.c
 +    if (sync->fast_disabled || !sync->max || sync->max > PW_SYNC_WORD_MAX_COUNT) return 0;
 +    cell = ps5_sync_prepare(&sync->obj, &sync->fast, &sync->fast_disabled,
 +        PW_SYNC_SEMAPHORE, sync->max, ps5_semaphore_read_value, ps5_semaphore_adopt_value);
-+    if (!cell) return -1;
++    if (!cell) return sync->fast_disabled ? 0 : -1;
 +    *word = &cell->word;
 +    return 1;
 +}

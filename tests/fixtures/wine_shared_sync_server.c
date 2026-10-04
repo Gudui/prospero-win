@@ -2,6 +2,7 @@
 /* Actual added helper bodies with independent list/refcount/legacy callbacks.
  * Does not run Wine or establish real wait/APC/handle integration semantics. */
 #include <assert.h>
+#include <errno.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -45,7 +46,17 @@ struct event { struct object obj; struct object *sync; struct list kernel_object
 struct semaphore_sync { struct object obj; unsigned count, max;
     struct ps5_sync_cell *fast; int fast_disabled; };
 struct semaphore { struct object obj; struct object *sync; int fast_eligible; };
+static unsigned allocation_calls;
+static int allocation_fail;
+static int fixture_memalign(void **storage, size_t alignment, size_t size)
+{
+    ++allocation_calls;
+    if (allocation_fail) return ENOMEM;
+    return posix_memalign(storage, alignment, size);
+}
+#define posix_memalign fixture_memalign
 #include "ps5_sync_server.inc"
+#undef posix_memalign
 
 static void exercise(unsigned kind)
 {
@@ -187,11 +198,94 @@ static void disable_all(void)
     free(ec); free(sc);
 }
 
+static void retained_budget(void)
+{
+    struct thread thread = {0};
+    struct event_sync syncs[4] = {0};
+    struct event events[4] = {0};
+    struct semaphore_sync sem_sync = {.obj = {.refcount = 1, .ops = &semaphore_sync_ops},
+                                     .count = 2, .max = 7};
+    struct semaphore sem = {.obj = {.refcount = 1, .handle_count = 1, .ops = &semaphore_ops},
+                            .sync = &sem_sync.obj, .fast_eligible = 1};
+    struct pw_sync_word *word = NULL, *same = NULL;
+    unsigned calls = allocation_calls;
+    assert(PW_SYNC_RETAINED_CELL_LIMIT > 0);
+    assert(PW_SYNC_RETAINED_CELL_LIMIT * sizeof(struct ps5_sync_cell) <= 1024u * 1024u);
+    assert((PW_SYNC_RETAINED_CELL_LIMIT + 1) * sizeof(struct ps5_sync_cell) > 1024u * 1024u);
+    assert(list_empty(&ps5_sync_active) && list_empty(&ps5_sync_pending));
+    for (unsigned i = 0; i < 4; ++i)
+    {
+        syncs[i].obj = (struct object){.refcount = 1, .ops = &event_sync_ops};
+        syncs[i].manual = i & 1; syncs[i].signaled = 1;
+        events[i].obj = (struct object){.refcount = 1, .handle_count = 1, .ops = &event_ops};
+        events[i].sync = &syncs[i].obj; events[i].fast_eligible = 1;
+        list_init(&syncs[i].obj.wait_queue); list_init(&events[i].kernel_object);
+    }
+    list_init(&sem_sync.obj.wait_queue);
+    /* Fixture-only counter positioning avoids allocating to a resource limit.
+     * Production never resets or decrements this lifetime admission counter. */
+    ps5_sync_retained_cells = PW_SYNC_RETAINED_CELL_LIMIT - 1;
+    allocation_fail = 1;
+    assert(ps5_get_event_word(&thread, &events[0].obj, &word) == -1);
+    assert(!word && !syncs[0].fast_disabled && !syncs[0].fast && syncs[0].obj.refcount == 1);
+    assert(ps5_sync_retained_cells == PW_SYNC_RETAINED_CELL_LIMIT - 1);
+    assert(allocation_calls == calls + 1);
+    allocation_fail = 0;
+    ps5_sync_server_begin();
+    assert(ps5_get_event_word(&thread, &events[0].obj, &word) == 1);
+    ps5_sync_server_end();
+    assert(ps5_sync_retained_cells == PW_SYNC_RETAINED_CELL_LIMIT && allocation_calls == calls + 2);
+    assert(syncs[0].obj.refcount == 2 && !(pw_sync_word_load(word) & PW_SYNC_WORD_SLOW));
+    assert(ps5_get_event_word(&thread, &events[0].obj, &same) == 1 && same == word);
+    assert(allocation_calls == calls + 2); /* Existing binding survives the cap. */
+    for (unsigned i = 1; i < 3; ++i)
+    {
+        same = word;
+        for (unsigned retry = 0; retry < 3; ++retry)
+            assert(!ps5_get_event_word(&thread, &events[i].obj, &same));
+        assert(same == word && syncs[i].fast_disabled && !syncs[i].fast);
+        assert(syncs[i].signaled == 1 && syncs[i].obj.refcount == 1);
+    }
+    same = word;
+    for (unsigned retry = 0; retry < 3; ++retry)
+        assert(!ps5_get_semaphore_word(&thread, &sem.obj, &same));
+    assert(same == word && sem_sync.fast_disabled && !sem_sync.fast);
+    assert(sem_sync.count == 2 && sem_sync.max == 7 && sem_sync.obj.refcount == 1);
+    assert(allocation_calls == calls + 2);
+    /* Ordinary callbacks remain usable on budget-rejected objects. */
+    struct wait_queue_entry entry;
+    assert(ps5_event_add_queue(&syncs[1].obj, &entry));
+    ps5_event_remove_queue(&syncs[1].obj, &entry);
+    assert(ps5_semaphore_add_queue(&sem_sync.obj, &entry));
+    ps5_semaphore_remove_queue(&sem_sync.obj, &entry);
+    assert(list_empty(&syncs[1].obj.wait_queue) && list_empty(&sem_sync.obj.wait_queue));
+    assert(pw_sync_word_try_wait(word));
+    struct ps5_sync_cell *cell = syncs[0].fast;
+    ps5_sync_server_begin();
+    assert(ps5_event_close_handle(&events[0].obj, NULL, 4));
+    ps5_sync_server_end();
+    assert(!syncs[0].signaled && syncs[0].obj.refcount == 1 && !syncs[0].fast);
+    assert(pw_sync_word_load(word) & PW_SYNC_WORD_SLOW);
+    assert(ps5_sync_retained_cells == PW_SYNC_RETAINED_CELL_LIMIT);
+    same = word;
+    assert(!ps5_get_event_word(&thread, &events[3].obj, &same));
+    assert(same == word && syncs[3].fast_disabled && !syncs[3].fast && syncs[3].obj.refcount == 1);
+    assert(allocation_calls == calls + 2 && list_empty(&ps5_sync_active) && list_empty(&ps5_sync_pending));
+    /* Fixture teardown only, after all native readers are gone. */
+    free(cell);
+    assert(ps5_sync_retained_cells == PW_SYNC_RETAINED_CELL_LIMIT);
+    printf("retained sync budget PASS: %zu cells/%zu requested bytes, retryable allocation failure, "
+           "stable binding at cap, permanent ordinary fallback and retirement\n",
+           (size_t)PW_SYNC_RETAINED_CELL_LIMIT,
+           (size_t)PW_SYNC_RETAINED_CELL_LIMIT * sizeof(struct ps5_sync_cell));
+}
+
 int main(void)
 {
     for (unsigned kind = PW_SYNC_AUTO_EVENT; kind <= PW_SYNC_SEMAPHORE; ++kind) exercise(kind);
     retire_before_activation();
     disable_all();
+    retained_budget();
     assert(!ps5_sync_operation_depth);
     puts("shared sync server PASS: exact cold/helper/queue bodies, 600 authority cycles, "
          "nested request and waiter gates, legacy-state adoption, pin lifetime, close/alias/disable retirement");

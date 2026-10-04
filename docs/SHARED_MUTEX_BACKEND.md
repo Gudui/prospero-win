@@ -51,11 +51,26 @@ after readiness returns. Ordinary multiwait and SignalObjectAndWait still
 use their existing callbacks and handlers; publication waits for nested
 completions to finish.
 
+The process retains at most one MiB of requested event/semaphore cell payload
+over its lifetime. The limit is computed from the complete native cell size;
+allocator metadata is additional. Only successful allocations consume the
+budget. Retiring a cell never returns that allowance, since old native cache
+entries must continue to address the same permanently SLOW word. An existing
+binding remains usable at the limit. New objects rejected by the full budget
+stay permanently on the ordinary path and produce exact negative client cache
+entries, avoiding repeated cold allocation attempts. A transient allocation
+failure leaves the object eligible for a later retry. This budget does not
+change the mutex backend, ABI or event/semaphore default-off selection.
+
 `python3 tests/test_wine_shared_sync_server.py` compiles the exact added
 authority, cold preparation, queue and retirement bodies with native fixture
 list/refcount callbacks. It checks 600 fast/legacy authority cycles, repeated
 slow entry, nested request completion, persistent waiters, state adoption,
-cold exclusions and pin/retirement lifetime. This fixture does not establish
+cold exclusions and pin/retirement lifetime. It positions a fixture-only
+admission counter at the boundary, without allocating to a resource limit,
+and checks allocation-failure retry, existing bindings at capacity, event and
+semaphore ordinary fallback, unchanged state/output/refcounts, and no budget
+reuse after retirement. This fixture does not establish
 real Wine wait, APC or handle semantics.
 
 Patch 0887 adds an independent `pw_wineserver_sync_backend` versioned native
