@@ -148,6 +148,8 @@ wine/wowprospero/thread_budget.h
 wine/wowprospero/host_memory.h
 wine/wowprospero/cpu.c
 wine/wowprospero/unix.c
+wine/wowprospero/profile_clock.h
+tests/test_wowprospero_profile_clock.py
 wine/wineps5/unix.c
 wine/wowprospero/wowprospero.h
 wine/wowprospero/wowprospero.spec

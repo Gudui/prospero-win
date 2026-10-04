@@ -627,6 +627,27 @@ the separate run/Unix/system-call timing split. The default fault-marker
 mode supplies the arena block map; sampling with fault markers disabled is
 refused explicitly.
 
+The report check uses a per-thread coarse TSC gate before reading
+`CLOCK_MONOTONIC`. Ordinary exits between probes read no clock and take no
+new lock; profiling disabled reads neither the TSC nor the clock for this
+check. A probe is allowed after `2^28` cycles. TSC controls only probe
+frequency, not elapsed time: report windows still require at least 5,000
+monotonic milliseconds, and each row records the actual interval. Reporting
+may be delayed until the next eligible exit. Failed clock reads retain the
+current window; a backwards clock restarts its origin. TSC wrap preserves
+short differences, while backwards/large TSC jumps permit another clock
+probe and do not themselves trigger a report. Snapshot and sampling behavior
+is unchanged.
+
+`tests/test_wowprospero_profile_clock.py` compiles the actual gate statements
+from `unix.c` with the shared scheduling header and a controlled native clock.
+It checks disabled-profile zero reads, probe/report boundaries, zero initial
+time, clock errors, TSC wrap/jumps and a synthetic 40-second workload with
+2,000,001 exits and 150 clock probes. This establishes scheduling behavior,
+not hardware cost, Wine signal semantics or a console frame-rate improvement.
+The gated translator requires its own console sampling/HL2 and matched-route
+comparison before using the new profiles to choose further optimizations.
+
 `wowprospero profile` reports the window duration, translated-arena samples,
 stub samples and histogram overflow. `wowprospero hotspot` names the guest
 PC and samples in re-encoded entry, body and exit code, or older emitted

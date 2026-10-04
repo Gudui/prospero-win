@@ -38,6 +38,7 @@
 #include "code_pages.h"
 #include "thread_budget.h"
 #include "host_memory.h"
+#include "profile_clock.h"
 
 /* The guest range every translated access is checked against (load_state). */
 enum { GUEST_LOW = 0x10000u, GUEST_HIGH = 0xfffff000u };
@@ -77,7 +78,7 @@ struct pw_thread
     double tsc_per_us;       /* measured at the last report */
     uint32_t n_unix, n_sys, n_other, n_unix_long, n_resets, n_flushes, last_reason;
     PwX86HotspotProfile *profile;
-    uint64_t profile_last_dump;
+    PwWowProfileClock profile_clock;
     uint64_t execution_clock_cost, execution_clock_resolution;
 };
 
@@ -739,17 +740,16 @@ static void profile_maybe_dump(void)
     sigset_t mask, previous;
     PwX86HotspotProfile *snapshot;
     uint64_t ms, interval, entry_samples = 0, body_samples = 0, exit_samples = 0, emitted_samples = 0;
-    unsigned tid = HandleToULong(NtCurrentTeb()->ClientId.UniqueThread);
+    unsigned tid;
     FILE *out = stderr;
     char path[512];
 
     if(!thread || !thread->profile) return;
-    clock_gettime(CLOCK_MONOTONIC, &now);
+    if(!pw_wow_profile_probe_due(&thread->profile_clock, __rdtsc())) return;
+    if(clock_gettime(CLOCK_MONOTONIC, &now)) return;
     ms = now.tv_sec * 1000ull + now.tv_nsec / 1000000;
-    if(!thread->profile_last_dump) { thread->profile_last_dump = ms; return; }
-    interval = ms - thread->profile_last_dump;
-    if(interval < 5000) return;
-    thread->profile_last_dump = ms;
+    if(!pw_wow_profile_report_due(&thread->profile_clock, ms, &interval)) return;
+    tid = HandleToULong(NtCurrentTeb()->ClientId.UniqueThread);
     snapshot = malloc(sizeof(*snapshot));
     if(!snapshot) return;
     sigemptyset(&mask);
