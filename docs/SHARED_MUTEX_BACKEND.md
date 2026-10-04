@@ -2,7 +2,8 @@
 
 Status: experimental Unix client/server source implemented and build-tested.
 Patch 0810 supplies server authority/lifetime hooks; 0820 adds the native ABI,
-client cache and default-off switch. Native fixtures and SDK pair builds
+client cache and default-off switch. Patch 0830 adds creation-time candidate
+selection. Native fixtures and SDK pair builds
 pass. Real Wine semantics, asynchronous thread/signal behavior and console
 performance remain unvalidated. The pair is held for source/runtime review;
 no hardware activation, PR or merge is approved by these source checks.
@@ -113,12 +114,21 @@ clients run. Readiness uses acquire/release atomics and downgrade retires
 active cells before server-lock release.
 
 The canonical handle table uses 128 pages of 64 KiB on the native 64-bit
-build, allocated only on demand. Empty, permanently ineligible and positive
-slots are distinct. A positive slot packs the permanent native cell pointer
+build, allocated only on demand at candidate creation. Empty, candidate,
+permanently ineligible and positive slots are distinct. A positive slot
+packs the permanent native cell pointer
 with its wait-access bit; release retains Wine's access-zero behavior.
-Invalid handles and allocation/token/readiness failures remain retryable
-and cannot create permanent negatives. More than 64 valid event handles
-can retain independent negatives without the old modulo hint collisions.
+Only a successful unnamed, non-inheritable `NtCreateMutant` marks a candidate.
+The hook uses already marshalled attributes and holds `fd_cache_mutex`
+across creation and slot initialization, resetting stale negatives on reuse.
+Default-off creation adds no cache lock or marker. Unmarked, pseudo and
+out-of-table handles fall through without signals, cache locking or metadata
+lookup; unrelated events do not pay a first-use probe. Readiness can be
+temporarily absent at creation without losing an otherwise valid marker.
+Candidate metadata/token/readiness failures stay retryable and cannot create
+permanent negatives. A failed cache-page allocation leaves that handle on
+ordinary semantics. More than 64 marked candidates subsequently reused as
+valid events can retain independent negatives without modulo collisions.
 
 All fills and their second lookups happen under `fd_cache_mutex`, with the
 existing uninterrupted-section machinery. Invalidation sits beside all
@@ -210,9 +220,16 @@ server-only candidate was preparation evidence; the complete pair below
 still requires the owner's source/runtime checks before deployment.
 
 `python3 tests/test_wine_shared_mutex_client.py` compiles the exact added
-client bodies and native ABI header from 0820. It also compiles the actual added
+client bodies from 0820 with each 0830 hunk applied, plus the native ABI header.
+It also compiles the actual added
 server lookup/ABI entry bodies. The generalized switch body is reconstructed
 from 0790 with each replacement verified against 0820's actual changes.
+An attributed public `NtCreateMutant` excerpt is patched with 0830's exact
+hunks and compiled with native request/attribute callbacks. Nine creation
+cases check default-off operation, unnamed/owned candidates, stale negative
+reset, named/inheritable exclusion, pre-readiness marking, informational
+success and ordinary error returns. Repeated unmarked, pseudo and
+out-of-table waits/releases perform no cold lookup or uninterrupted section.
 It checks strict default-off file/environment selection and independence
 of the typed and shared switches. With fixture metadata, server context and
 uninterrupted-section callbacks, it checks ABI mismatch rejection, 15 cold
@@ -224,6 +241,13 @@ release, a second page, readiness downgrade, temporary SLOW recovery, ordinary c
 ASan/UBSan runs pass. These callbacks do not model the complete Wine server,
 its signals or exception delivery; they do not measure the WoW64 entry or
 establish a console speedup.
+
+The 0830 SDK revision retains the unchanged server member of the matching
+pair and rebuilds every ntdll C unit against consistent private headers.
+A control without 0830 reproduces the earlier candidate ntdll byte-for-byte.
+The exact three-unit patch application and compiler-input identities are
+recorded separately from native fixture results. Both this revised pair and
+the original pair still require the owner's full runtime/console gates.
 
 The complete matching SDK pair rebuild compiles every server and ntdll
 unit against private, consistent headers. Its baseline arms reproduce both

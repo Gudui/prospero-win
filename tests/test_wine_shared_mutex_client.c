@@ -28,16 +28,17 @@ static obj_handle_t wine_server_obj_handle(HANDLE h) { return (obj_handle_t)h; }
 static uint64_t inprocess_teb(void) { return (uint64_t)(uintptr_t)&fixture_thread; }
 static pthread_mutex_t fd_cache_mutex=PTHREAD_MUTEX_INITIALIZER;
 static _Atomic unsigned cold_calls, sections;
+static _Thread_local unsigned section_depth;
 static void *pages[8]; static unsigned page_count;
 static void *anon_mmap_alloc(size_t size,int prot) {
     assert(prot==(PROT_READ|PROT_WRITE) && page_count<8);
     void *p=calloc(1,size); if (!p) return MAP_FAILED; pages[page_count++]=p; return p;
 }
 static void server_enter_uninterrupted_section(pthread_mutex_t *lock,sigset_t *set) {
-    (void)set; assert(!pthread_mutex_lock(lock)); atomic_fetch_add(&sections,1);
+    (void)set; assert(!pthread_mutex_lock(lock)); ++section_depth; atomic_fetch_add(&sections,1);
 }
 static void server_leave_uninterrupted_section(pthread_mutex_t *lock,sigset_t *set) {
-    (void)set; assert(!pthread_mutex_unlock(lock));
+    (void)set; assert(section_depth); --section_depth; assert(!pthread_mutex_unlock(lock));
 }
 struct node { struct pw_mutex_word word; unsigned handle,kind,access; };
 static struct node nodes[100]; static unsigned node_count;
@@ -89,6 +90,89 @@ static const struct pw_mutex_backend *shared_mutex_backend;
 #include "shared_mutex_client.inc"
 static const char *config_dir;
 #include "shared_mutex_switch.inc"
+
+/* Compile the actual NtCreateMutant body with native request/attribute
+ * callbacks. Caller buffers are valid local storage; no Wine or faults. */
+typedef uint32_t NTSTATUS;
+typedef uint32_t ACCESS_MASK;
+typedef unsigned BOOLEAN;
+typedef unsigned data_size_t;
+#define OBJ_INHERIT 2u
+#define WINAPI
+#define TRACE(...) ((void)0)
+typedef struct { unsigned Attributes, name_len; } OBJECT_ATTRIBUTES;
+struct object_attributes { unsigned attributes, name_len; };
+static struct { unsigned access, owned; } create_request;
+static struct { unsigned handle; } create_reply;
+static unsigned create_handle=6000,create_status,alloc_status,create_calls;
+#define SERVER_START_REQ(kind) do { typeof(create_request) *req=&create_request; typeof(create_reply) *reply=&create_reply;
+#define SERVER_END_REQ } while(0)
+static NTSTATUS wine_server_alloc_object_attributes(const OBJECT_ATTRIBUTES *attr,
+                                                     struct object_attributes **out,data_size_t *size) {
+    if (alloc_status) return alloc_status;
+    *out=calloc(1,sizeof(**out)); assert(*out); *size=sizeof(**out);
+    if (attr) { (*out)->attributes=attr->Attributes; (*out)->name_len=attr->name_len; }
+    return 0;
+}
+static void wine_server_add_data(void *request,const void *data,unsigned size) {
+    assert(request==&create_request && data && size==sizeof(struct object_attributes));
+}
+static NTSTATUS wine_server_call(void *request) {
+    assert(request==&create_request && section_depth==(unsigned)server_shared_mutex_enabled());
+    create_reply.handle=(int32_t)create_status<0 ? 0 : create_handle; ++create_calls; return create_status;
+}
+static HANDLE wine_server_ptr_handle(unsigned h) { return h; }
+static void server_clear_fast_mutex_hint(HANDLE h) { (void)h; }
+#include "shared_mutex_create.inc"
+
+static void mark_candidate(HANDLE handle) {
+    sigset_t set; server_enter_uninterrupted_section(&fd_cache_mutex,&set);
+    server_init_shared_mutex_slot(handle,1);
+    server_leave_uninterrupted_section(&fd_cache_mutex,&set);
+}
+static void expect_no_probe(HANDLE handle) {
+    unsigned cold_before=cold_calls,sections_before=sections;
+    for (unsigned i=0;i<100;i++) {
+        assert(server_try_shared_mutex(handle,0,NULL,NULL)==STATUS_NOT_IMPLEMENTED);
+        assert(server_try_shared_mutex(handle,1,NULL,NULL)==STATUS_NOT_IMPLEMENTED);
+    }
+    assert(cold_calls==cold_before && sections==sections_before);
+}
+static void test_creation(void) {
+    HANDLE result=99; unsigned before=sections,calls=create_calls;
+    const struct pw_mutex_backend *api=shared_mutex_backend;
+    shared_mutex_backend=NULL;
+    assert(!server_shared_mutex_enabled());
+    assert(!NtCreateMutant(&result,SYNCHRONIZE,NULL,0) && result==create_handle);
+    assert(sections==before && !shared_mutex_slot(create_handle,0));
+    shared_mutex_backend=api;
+    assert(server_shared_mutex_enabled());
+    assert(!NtCreateMutant(&result,SYNCHRONIZE,NULL,0));
+    uintptr_t *slot=shared_mutex_slot(result,0); assert(slot && *slot==PW_MUTEX_SLOT_CANDIDATE);
+    assert(create_request.access==SYNCHRONIZE && !create_request.owned && !section_depth);
+    /* A newly created handle resets a stale negative, and published output
+     * is ordinary caller storage after the uninterrupted section ends. */
+    __atomic_store_n(slot,PW_MUTEX_SLOT_NEGATIVE,__ATOMIC_RELEASE);
+    assert(!NtCreateMutant(&result,0,NULL,1) && *slot==PW_MUTEX_SLOT_CANDIDATE);
+    assert(!create_request.access && create_request.owned);
+    OBJECT_ATTRIBUTES named={.name_len=8},inherited={.Attributes=OBJ_INHERIT};
+    assert(!NtCreateMutant(&result,SYNCHRONIZE,&named,0) && !*slot); expect_no_probe(result);
+    assert(!NtCreateMutant(&result,SYNCHRONIZE,&inherited,0) && !*slot); expect_no_probe(result);
+    /* Selection remains on before native readiness: publish a marker for
+     * later lookup, while current operations immediately fall through. */
+    __atomic_store_n(&ready,0,__ATOMIC_RELEASE);
+    assert(server_shared_mutex_enabled() && !NtCreateMutant(&result,0,NULL,0));
+    assert(*slot==PW_MUTEX_SLOT_CANDIDATE); expect_no_probe(result);
+    __atomic_store_n(&ready,1,__ATOMIC_RELEASE);
+    create_status=0x40000000u; /* Existing named object: informational success. */
+    assert(NtCreateMutant(&result,0,&named,0)==create_status && result==create_handle && !*slot);
+    create_status=0xc000000du;
+    assert(NtCreateMutant(&result,0,NULL,0)==create_status && !result);
+    create_status=0; alloc_status=0xc000000du; before=sections;
+    assert(NtCreateMutant(&result,0,NULL,0)==alloc_status && !result);
+    assert(sections==before && !section_depth); alloc_status=0;
+    assert(create_calls==calls+8);
+}
 
 static void write_switch(const char *name,const char *value) {
     char *path; assert(asprintf(&path,"%s/%s",config_dir,name)>0);
@@ -204,7 +288,13 @@ int main(int argc,char **argv) {
     wrong.get_word=NULL; assert(!pw_mutex_backend_valid(&wrong));
     struct node *first=node(4,1,SYNCHRONIZE);
     test_lookup_gates(api);
-    take_release(4); assert(fixture_thread.ps5_mutex_token==101 && cold_calls==1 && sections==1);
+    /* Unknown events/pseudo/out-of-table values never enter a cold section. */
+    expect_no_probe(4); expect_no_probe(0); expect_no_probe((HANDLE)-1);
+    expect_no_probe((HANDLE)-2); expect_no_probe(5556);
+    expect_no_probe(4u*(PW_MUTEX_CACHE_PAGES*PW_MUTEX_CACHE_SLOTS+1u));
+    test_creation();
+    unsigned first_sections=sections; mark_candidate(4);
+    take_release(4); assert(fixture_thread.ps5_mutex_token==101 && cold_calls==1 && sections==first_sections+2);
     assert(global_error==7 && server_threads[1].error==9 && !server_threads[1].refs && !current);
     unsigned cold_before=cold_calls, sections_before=sections;
     for (unsigned i=0;i<12000;i++) take_release(4);
@@ -217,26 +307,31 @@ int main(int argc,char **argv) {
     assert(server_try_shared_mutex(4,1,NULL,&previous)==STATUS_SUCCESS && previous==0);
     /* Zero wait access cannot acquire, while release keeps Wine access 0. */
     struct node *without_access=node(8,1,0);
+    mark_candidate(8);
     assert(server_try_shared_mutex(8,0,NULL,NULL)==STATUS_NOT_IMPLEMENTED);
     assert(!pw_mutex_word_load(&without_access->word));
     assert(pw_mutex_word_try_acquire(&without_access->word,fixture_thread.ps5_mutex_token));
     assert(server_try_shared_mutex(8,1,NULL,NULL)==STATUS_SUCCESS);
-    /* More than 64 distinct valid event handles retain exact negative slots. */
+    /* Server-side reuse can turn a marked candidate into an event. More
+     * than 64 such valid negatives retain independent exact slots. */
     for (unsigned i=0;i<80;i++) {
-        unsigned h=1000+4*i; node(h,0,0);
+        unsigned h=1000+4*i; node(h,0,0); mark_candidate(h);
         assert(server_try_shared_mutex(h,0,NULL,NULL)==STATUS_NOT_IMPLEMENTED);
     }
     cold_before=cold_calls; sections_before=sections;
     for (unsigned pass=0;pass<25;pass++) for (unsigned i=0;i<80;i++)
         assert(server_try_shared_mutex(1000+4*i,0,NULL,NULL)==STATUS_NOT_IMPLEMENTED);
     assert(cold_calls==cold_before && sections==sections_before);
+    /* A reused negative becomes a candidate on eligible mutant creation. */
+    nodes[2].kind=1; nodes[2].access=SYNCHRONIZE; mark_candidate(1000); take_release(1000);
     /* A valid cold retry must not create a lasting negative. */
     struct node *retry=node(1400,1,SYNCHRONIZE); retry_once=1;
+    mark_candidate(1400);
     assert(server_try_shared_mutex(1400,0,NULL,NULL)==STATUS_NOT_IMPLEMENTED);
-    assert(!__atomic_load_n(shared_mutex_slot(1400,0),__ATOMIC_ACQUIRE)); take_release(1400);
+    assert(__atomic_load_n(shared_mutex_slot(1400,0),__ATOMIC_ACQUIRE)==PW_MUTEX_SLOT_CANDIDATE); take_release(1400);
     assert(!pw_mutex_word_load(&retry->word));
-    /* A second page is allocated only on cold fill; other slots stay intact. */
-    unsigned high=4*(PW_MUTEX_CACHE_SLOTS+7)+4; node(high,1,SYNCHRONIZE); take_release(high);
+    /* A second page is allocated only on candidate creation. */
+    unsigned high=4*(PW_MUTEX_CACHE_SLOTS+7)+4; node(high,1,SYNCHRONIZE); mark_candidate(high); take_release(high);
     assert(page_count==1); cold_before=cold_calls; sections_before=sections; take_release(high);
     assert(cold_calls==cold_before && sections==sections_before);
     /* Readiness downgrade is a fallback with zero extra cold calls/locks. */
@@ -257,6 +352,7 @@ int main(int argc,char **argv) {
     assert(!pthread_mutex_lock(&fd_cache_mutex));
     uint64_t old; pw_mutex_word_freeze(&first->word,&old); first->handle=0;
     server_clear_shared_mutex_slot(4); struct node *replacement=node(4,1,SYNCHRONIZE);
+    server_init_shared_mutex_slot(4,1);
     assert(!pthread_mutex_unlock(&fd_cache_mutex)); take_release(4);
     assert(pw_mutex_word_load(&first->word)&PW_MUTEX_WORD_SLOW);
     assert(!pw_mutex_word_load(&replacement->word));
@@ -269,6 +365,6 @@ int main(int argc,char **argv) {
     assert(global_error==7 && !current && !server_depth);
     for (unsigned i=0;i<256;i++) assert(!server_threads[i].refs);
     for (unsigned i=0;i<page_count;i++) free(pages[i]);
-    printf("PASS: strict independent switches, 15 lookup gates, 24000 warm hits without cold calls/locks, 80 exact negatives, legal lifecycle, 12000 concurrent sections\n");
+    printf("PASS: actual creation gate, unknown/pseudo/out-of-table immediate fallback, strict independent switches, 15 lookup gates, 24000 warm hits without cold calls/locks, 80 exact negatives, legal lifecycle, 12000 concurrent sections\n");
     return 0;
 }

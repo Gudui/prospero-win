@@ -12,6 +12,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 PATCH = ROOT / 'wine/patches/0820-ntdll-ps5-shared-mutex-client.patch'
+CANDIDATES = ROOT / 'wine/patches/0830-ntdll-ps5-shared-mutex-candidates.patch'
 
 
 def additions(patch, file):
@@ -32,10 +33,36 @@ def function_body(text, signature):
     raise AssertionError('unterminated source function')
 
 
+def apply_hunks(text, patch, file):
+    part = next(p for p in patch.read_text().split('diff --git ')[1:]
+                if p.splitlines()[0].endswith(' b/' + file))
+    hunks = []
+    before, after = [], []
+    active = False
+    for line in part.splitlines(keepends=True):
+        if line.startswith('@@ '):
+            if active: hunks.append((''.join(before), ''.join(after)))
+            before, after, active = [], [], True
+        elif active:
+            if line.startswith('+'): after.append(line[1:])
+            elif line.startswith('-'): before.append(line[1:])
+            elif line.startswith(' '): before.append(line[1:]); after.append(line[1:])
+            elif line == '\n': before.append(line); after.append(line)
+            else: raise AssertionError('unexpected patch line')
+    if active: hunks.append((''.join(before), ''.join(after)))
+    for before, after in hunks:
+        assert text.count(before) == 1, before
+        text = text.replace(before, after)
+    return text
+
+
 def main():
-    body = additions(PATCH, 'dlls/ntdll/unix/server.c')
+    body = apply_hunks(additions(PATCH, 'dlls/ntdll/unix/server.c'),
+                       CANDIDATES, 'dlls/ntdll/unix/server.c')
     cache = body[body.index('/* Exact canonical handle table,'):]
     cache = cache[:cache.index('\n#endif')]
+    cache += '\n' + function_body(body, 'int server_shared_mutex_enabled(')
+    cache += '\n' + function_body(body, 'void server_init_shared_mutex_slot(')
     cache += '\n' + function_body(body, 'void server_clear_shared_mutex_slot(')
     # Every existing close_inproc_sync call has its preceding added clear.
     for file, expected in [('dlls/ntdll/unix/server.c', 3), ('dlls/ntdll/unix/thread.c', 1)]:
@@ -70,6 +97,9 @@ def main():
             switch = switch.replace(before, after)
         (folder / 'shared_mutex_switch.inc').write_text(switch)
         (folder / 'shared_mutex_client.inc').write_text(cache)
+        create = (ROOT / 'tests/fixtures/wine_mutant_create.c').read_text()
+        create = apply_hunks(create, CANDIDATES, 'dlls/ntdll/unix/sync.c')
+        (folder / 'shared_mutex_create.inc').write_text(create)
         server = additions(PATCH, 'server/request.c')
         server_abi = function_body(server, 'static int get_shared_mutex_word(')
         server_abi += function_body(server, 'DECLSPEC_EXPORT const struct pw_mutex_backend *pw_wineserver_mutex_backend(')
