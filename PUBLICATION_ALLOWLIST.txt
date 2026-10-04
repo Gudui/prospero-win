@@ -329,3 +329,8 @@ tests/test_pw_diagnostics.c
 src/pw_script_input.c
 src/pw_script_input.h
 tests/test_pw_script_input.c
+
+wine/patches/0870-server-ps5-release-image-view-fds.patch
+tests/fixtures/wine_image_view_fds.c
+tests/test_wine_image_view_fds.py
+docs/IMAGE_VIEW_FD_LIFETIME.md
