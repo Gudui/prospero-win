@@ -35,15 +35,16 @@ waking a waiter takes one thread switch instead of two.
 - WINE_PS5_SERVER_DIRECT=0, or a server module without the export, keeps
   every request on the pipe.
 
-The sleep epoch is captured before unlocking, and the direct enable gate
-is read under the server mutex. Slow-request logs retain the original
-request opcode before the reply overwrites the request/reply union.
+The sleep epoch is captured before unlocking. The direct enable gate uses
+atomic loads/stores, preserving the disabled-mode fallback before locking
+and the authoritative recheck under the server mutex. Slow-request logs
+retain the original opcode before the reply replaces the request/reply union.
 ---
  dlls/ntdll/unix/server.c |   37 ++++++++++
  server/fd.c              |  101 ++++++++++++++++++++++++++++
  server/request.c         |  164 ++++++++++++++++++++++++++++++++++++++++++++++
- server/request.h         |    5 +
- 4 files changed, 306 insertions(+), 1 deletion(-)
+ server/request.h         |   15 ++++
+ 4 files changed, 316 insertions(+), 1 deletion(-)
 
 diff --git a/dlls/ntdll/unix/server.c b/dlls/ntdll/unix/server.c
 index bdfad82..7af0f4b 100644
@@ -111,7 +112,7 @@ index bdfad82..7af0f4b 100644
      free( dir );
      free( module_path );
 diff --git a/server/fd.c b/server/fd.c
-index c10e6b6..72e591c 100644
+index c10e6b6..3d5e9a0 100644
 --- a/server/fd.c
 +++ b/server/fd.c
 @@ -288,6 +288,50 @@ timeout_t monotonic_time;
@@ -180,7 +181,7 @@ index c10e6b6..72e591c 100644
  
      if (epoll_fd == -1) return;
 +#ifdef WINE_INPROCESS_SERVER
-+    inprocess_direct_ok = 1;
++    inprocess_set_direct_enabled( 1 );
 +#endif
  
      while (active_users)
@@ -217,7 +218,7 @@ index c10e6b6..72e591c 100644
  
      if (kqueue_fd == -1) return;
 +#ifdef WINE_INPROCESS_SERVER
-+    inprocess_direct_ok = 1;
++    inprocess_set_direct_enabled( 1 );
 +#endif
  
      while (active_users)
@@ -269,7 +270,7 @@ index c10e6b6..72e591c 100644
      /* fall through to normal poll loop */
 +#ifdef WINE_INPROCESS_SERVER
 +    /* poll() reads the poll arrays while it sleeps: clients must not change them */
-+    inprocess_direct_ok = 0;
++    inprocess_set_direct_enabled( 0 );
 +#endif
  
      while (active_users)
@@ -309,7 +310,7 @@ index c10e6b6..72e591c 100644
  
      if (events == -1)  /* stop waiting on this fd completely */
 diff --git a/server/request.c b/server/request.c
-index 08dd6cd..4f76b97 100644
+index 08dd6cd..0fafa53 100644
 --- a/server/request.c
 +++ b/server/request.c
 @@ -60,6 +60,9 @@
@@ -396,7 +397,7 @@ index 08dd6cd..4f76b97 100644
 +    unsigned int i;
 +    int ret = 1;
 +
-+    if (!is_direct_request( req ) || size > sizeof(data)) return 1;
++    if (!inprocess_direct_enabled() || !is_direct_request( req ) || size > sizeof(data)) return 1;
 +    for (i = 0; i < info->data_count && i < __SERVER_MAX_DATA; i++)
 +    {
 +        if (info->data[i].size > size - pos) return 1;
@@ -406,7 +407,7 @@ index 08dd6cd..4f76b97 100644
 +    if (pos != size) return 1;
 +
 +    lock_server_for_client();
-+    if (!inprocess_direct_ok || !(thread = get_thread_from_id( tid )))
++    if (!inprocess_direct_enabled() || !(thread = get_thread_from_id( tid )))
 +    {
 +        pthread_mutex_unlock( &inprocess_server_mutex );
 +        return 1;
@@ -505,10 +506,10 @@ index 08dd6cd..4f76b97 100644
          return;
      }
 diff --git a/server/request.h b/server/request.h
-index 397f662..55ac3a9 100644
+index 397f662..eb6c102 100644
 --- a/server/request.h
 +++ b/server/request.h
-@@ -59,9 +59,14 @@ extern timeout_t monotonic_counter(void);
+@@ -59,9 +59,24 @@ extern timeout_t monotonic_counter(void);
  #define WINE_INPROCESS_SERVER 1
  #endif
  #ifdef WINE_INPROCESS_SERVER
@@ -519,6 +520,16 @@ index 397f662..55ac3a9 100644
 +/* client threads running requests themselves (fd.c, request.c) */
 +extern pthread_mutex_t inprocess_server_mutex;
 +extern int inprocess_direct_ok;
++/* Preserve the unlocked disabled-mode fast fallback without a data race.
++ * The check after taking the server mutex remains authoritative. */
++static inline int inprocess_direct_enabled(void)
++{
++    return __atomic_load_n( &inprocess_direct_ok, __ATOMIC_ACQUIRE );
++}
++static inline void inprocess_set_direct_enabled( int enabled )
++{
++    __atomic_store_n( &inprocess_direct_ok, enabled, __ATOMIC_RELEASE );
++}
 +extern int inprocess_wake_fd;
  #endif
  extern void open_master_socket(void);

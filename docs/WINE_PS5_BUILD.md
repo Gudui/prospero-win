@@ -306,12 +306,20 @@ two paths.
 The server captures the poll-user epoch while holding its mutex, before
 letting client threads run. After waking and taking the mutex again, it
 compares that snapshot to the current epoch before using the returned
-events. The direct-request enable gate is also read under that mutex.
+events. The direct-request enable gate uses atomic loads and stores. A
+disabled gate returns to the pipe before copying request data or waiting
+for the server mutex; an enabled gate is checked again after taking the
+mutex. This preserves the original disabled-mode fallback while removing
+the concurrent ordinary read.
 Slow-request diagnostics save the request opcode before the reply replaces
 the request/reply union, so both transports report the operation requested.
 
 These synchronization and diagnostic corrections require their own console
-validation. Results from an earlier module do not validate the corrected
+validation. The first corrected pair, which removed the early enable check,
+failed the HL2 startup gate and was withdrawn; its failure's cause remains
+unproven. Native eligibility checks with mocked locking verify the revised
+gate's fallback contract, not the console deadlock's cause or resolution.
+Results from an earlier module do not validate the corrected
 pair; compare exact modules with the same translator, PE files, scene and
 profiler settings, then check the file controls and game regressions.
 
