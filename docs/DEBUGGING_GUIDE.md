@@ -442,6 +442,20 @@ entry, not kernel syscall counts or CPU time. They include dispatcher work,
 blocking and scheduling; a guest callback can end a span before its original
 service finishes. There are no guest-stack reads.
 
+`long_wall_ns` sums the full duration of completed valid spans at or above
+`long_threshold_ns` (500 microseconds), including the threshold itself, rather
+than just their excess over the threshold. It appears in both summary and
+per-service rows; `overflow_long_wall_ns` covers IDs beyond the table's
+capacity. These fields use saturating cumulative counters like `wall_ns`.
+For an interval, subtract successive rows from the same thread instance;
+reject saturated or decreasing counters and account for clock errors and
+abandoned spans. Per-service rows show only the top four IDs, so missing
+rows do not mean zero work. Older logs without these fields have unknown
+long-span totals: do not substitute zero or estimate them from `max_ns` and
+`long_calls`. The totals still include execution, waits and scheduling;
+neither they nor `wall_ns - long_wall_ns` measure CPU time or identify
+blocking. Use wait-object evidence to classify the spans.
+
 The table holds 128 distinct IDs. New IDs after it fills go to explicit
 overflow totals; recorded IDs remain distinct. Clock errors, replaced pending
 spans and saturated counters are reported. A still-pending call appears in the
