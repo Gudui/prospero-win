@@ -11,10 +11,11 @@ ReleaseMutex or zero-timeout wait, and GTA IV makes about 500 of them a
 frame.
 
 The server is now guarded by a lock that its thread holds except while it
-sleeps in kqueue/epoll, and ntdll runs the requests that only touch sync
-objects and handles (select, event_op, release_mutex, release_semaphore,
-the create and query requests of events, mutexes, semaphores and keyed
-events, close_handle, dup_handle) on the calling thread through
+sleeps in kqueue/epoll, and ntdll runs the requests that touch sync
+objects, handles and file opens (select, event_op, release_mutex,
+release_semaphore, the create and query requests of events, mutexes,
+semaphores and keyed events, close_handle, dup_handle, create_file and
+get_handle_fd) on the calling thread through
 pw_wineserver_call_direct, under that lock. A wait that cannot be
 satisfied still returns STATUS_PENDING and the thread sleeps on its wait
 pipe; the thread that signals the object writes that pipe itself, so
@@ -28,22 +29,27 @@ waking a waiter takes one thread switch instead of two.
 - A thread the server does not know (before init_thread, with another
   TEB, terminated) and every other request use the pipe as before, as does
   everything when the main loop falls back to poll().
-- The open requests stay on the pipe: they carry the application's name
-  buffer, which the server must not read on the client thread.
+- Named-object open requests stay on the pipe: they carry the application's
+  name buffer, which the server must not read on the client thread. File
+  opens instead carry ntdll-owned copies of the attributes and Unix name.
 - WINE_PS5_SERVER_DIRECT=0, or a server module without the export, keeps
   every request on the pipe.
+
+The sleep epoch is captured before unlocking, and the direct enable gate
+is read under the server mutex. Slow-request logs retain the original
+request opcode before the reply overwrites the request/reply union.
 ---
- dlls/ntdll/unix/server.c |  34 +++++++++
- server/fd.c              |  99 ++++++++++++++++++++++++
-server/request.c         | 164 +++++++++++++++++++++++++++++++++++++++
- server/request.h         |   5 ++
- 4 files changed, 302 insertions(+)
+ dlls/ntdll/unix/server.c |   37 ++++++++++
+ server/fd.c              |  101 ++++++++++++++++++++++++++++
+ server/request.c         |  164 ++++++++++++++++++++++++++++++++++++++++++++++
+ server/request.h         |    5 +
+ 4 files changed, 306 insertions(+), 1 deletion(-)
 
 diff --git a/dlls/ntdll/unix/server.c b/dlls/ntdll/unix/server.c
-index bdfad82..340cbfb 100644
+index bdfad82..7af0f4b 100644
 --- a/dlls/ntdll/unix/server.c
 +++ b/dlls/ntdll/unix/server.c
-@@ -317,6 +317,20 @@ ULONGLONG ps5_now_us(void)
+@@ -317,17 +317,48 @@ ULONGLONG ps5_now_us(void)
      return (ULONGLONG)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
  }
  
@@ -64,8 +70,9 @@ index bdfad82..340cbfb 100644
  unsigned int server_call_unlocked( void *req_ptr )
  {
      struct thread_data *data = get_thread_data();
-@@ -324,6 +338,22 @@ unsigned int server_call_unlocked( void *req_ptr )
+     struct __server_request_info * const req = req_ptr;
      unsigned int ret;
++    int request_opcode = req->u.req.request_header.req;
      ULONGLONG start = ps5_slow_log() ? ps5_now_us() : 0;
  
 +#ifdef WINE_INPROCESS_SERVER
@@ -77,7 +84,7 @@ index bdfad82..340cbfb 100644
 +            ret = req->u.reply.reply_header.error;
 +            if (start && ps5_now_us() - start > 200000)
 +                fprintf( stderr, "wine-ps5: slow direct request=%d ms=%llu tid=%04x\n",
-+                         (int)req->u.req.request_header.req, (unsigned long long)((ps5_now_us() - start) / 1000), (int)data->tid );
++                         request_opcode, (unsigned long long)((ps5_now_us() - start) / 1000), (int)data->tid );
 +            return ret;
 +        case 2:
 +            abort_thread( 0 );  /* the server killed this thread */
@@ -87,7 +94,12 @@ index bdfad82..340cbfb 100644
      if ((ret = send_request( data->request_fd, req ))) return ret;
      ret = wait_reply( data->reply_fd, req );
      if (start && ps5_now_us() - start > 200000)
-@@ -1491,6 +1521,10 @@ static int connect_inprocess_server(void)
+-        fprintf( stderr, "wine-ps5: slow request=%d ms=%llu tid=%04x\n", (int)req->u.req.request_header.req,
++        fprintf( stderr, "wine-ps5: slow request=%d ms=%llu tid=%04x\n", request_opcode,
+                  (ps5_now_us() - start) / 1000, (int)data->tid );
+     return ret;
+ }
+@@ -1491,6 +1522,10 @@ static int connect_inprocess_server(void)
      register_server_thread = dlsym( module, "pw_wine_thread_register" );
      if ((fd = connect_server( nls_dir )) == -1)
          fatal_error( "the in-process server %s did not start\n", module_path );
@@ -99,10 +111,10 @@ index bdfad82..340cbfb 100644
      free( dir );
      free( module_path );
 diff --git a/server/fd.c b/server/fd.c
-index c10e6b6..901dbd4 100644
+index c10e6b6..72e591c 100644
 --- a/server/fd.c
 +++ b/server/fd.c
-@@ -288,6 +288,48 @@ timeout_t monotonic_time;
+@@ -288,6 +288,50 @@ timeout_t monotonic_time;
  struct _KUSER_SHARED_DATA *user_shared_data = NULL;
  static const timeout_t user_shared_data_timeout = 16 * 10000;
  
@@ -130,11 +142,13 @@ index c10e6b6..901dbd4 100644
 +/* the main loop goes to sleep: let client threads in */
 +static unsigned int inprocess_sleep( int timeout, const struct timespec *ts )
 +{
++    unsigned int epoch = poll_users_epoch;
++
 +    if (timeout == -1) inprocess_sleep_until = TIMEOUT_INFINITE;
 +    else if (ts) inprocess_sleep_until = monotonic_time + ts->tv_sec * TICKS_PER_SEC + ts->tv_nsec / 100;
 +    else inprocess_sleep_until = monotonic_time + (timeout_t)timeout * 10000;
 +    pthread_mutex_unlock( &inprocess_server_mutex );
-+    return poll_users_epoch;
++    return epoch;
 +}
 +
 +/* the main loop wakes up; returns 0 when clients removed or changed poll
@@ -151,7 +165,7 @@ index c10e6b6..901dbd4 100644
  static void atomic_store_ulong(volatile ULONG *ptr, ULONG value)
  {
      /* on x86 there should be total store order guarantees, so volatile is
-@@ -381,6 +423,9 @@ struct timeout_user *add_timeout_user( timeout_t when, timeout_callback func, vo
+@@ -381,6 +425,9 @@ struct timeout_user *add_timeout_user( timeout_t when, timeout_callback func, vo
      user->when     = timeout_to_abstime( when );
      user->callback = func;
      user->private  = private;
@@ -161,7 +175,7 @@ index c10e6b6..901dbd4 100644
  
      /* Now insert it in the linked list */
  
-@@ -538,13 +583,22 @@ static inline void main_loop_epoll(void)
+@@ -538,13 +585,22 @@ static inline void main_loop_epoll(void)
      assert( POLLHUP == EPOLLHUP );
  
      if (epoll_fd == -1) return;
@@ -184,7 +198,7 @@ index c10e6b6..901dbd4 100644
  
  #ifdef HAVE_EPOLL_PWAIT2
          if (!failed_epoll_pwait2)
-@@ -557,6 +611,13 @@ static inline void main_loop_epoll(void)
+@@ -557,6 +613,13 @@ static inline void main_loop_epoll(void)
  #endif
              ret = epoll_wait( epoll_fd, events, ARRAY_SIZE( events ), timeout );
  
@@ -198,7 +212,7 @@ index c10e6b6..901dbd4 100644
          set_current_time();
  
          /* put the events into the pollfd array first, like poll does */
-@@ -643,16 +704,32 @@ static inline void main_loop_epoll(void)
+@@ -643,16 +706,32 @@ static inline void main_loop_epoll(void)
      struct kevent events[128];
  
      if (kqueue_fd == -1) return;
@@ -231,7 +245,7 @@ index c10e6b6..901dbd4 100644
          set_current_time();
  
          /* put the events into the pollfd array first, like poll does */
-@@ -830,6 +907,9 @@ static void remove_poll_user( struct fd *fd, int user )
+@@ -830,6 +909,9 @@ static void remove_poll_user( struct fd *fd, int user )
      assert( poll_users[user] == fd );
  
      remove_epoll_user( fd, user );
@@ -241,7 +255,7 @@ index c10e6b6..901dbd4 100644
      pollfd[user].fd = -1;
      pollfd[user].events = 0;
      pollfd[user].revents = 0;
-@@ -934,11 +1014,18 @@ void main_loop(void)
+@@ -934,11 +1016,18 @@ void main_loop(void)
  {
      int i, ret, timeout;
  
@@ -260,7 +274,7 @@ index c10e6b6..901dbd4 100644
  
      while (active_users)
      {
-@@ -946,7 +1033,13 @@ void main_loop(void)
+@@ -946,7 +1035,13 @@ void main_loop(void)
  
          if (!active_users) break;  /* last user removed by a timeout */
  
@@ -274,7 +288,7 @@ index c10e6b6..901dbd4 100644
          set_current_time();
  
          if (ret > 0)
-@@ -961,6 +1054,9 @@ void main_loop(void)
+@@ -961,6 +1056,9 @@ void main_loop(void)
              }
          }
      }
@@ -284,7 +298,7 @@ index c10e6b6..901dbd4 100644
  }
  
  
-@@ -1624,6 +1720,9 @@ void set_fd_events( struct fd *fd, int events )
+@@ -1624,6 +1722,9 @@ void set_fd_events( struct fd *fd, int events )
      int user = fd->poll_index;
      assert( poll_users[user] == fd );
  
@@ -295,7 +309,7 @@ index c10e6b6..901dbd4 100644
  
      if (events == -1)  /* stop waiting on this fd completely */
 diff --git a/server/request.c b/server/request.c
-index 08dd6cd..e2ae2c5 100644
+index 08dd6cd..4f76b97 100644
 --- a/server/request.c
 +++ b/server/request.c
 @@ -60,6 +60,9 @@
@@ -382,7 +396,7 @@ index 08dd6cd..e2ae2c5 100644
 +    unsigned int i;
 +    int ret = 1;
 +
-+    if (!inprocess_direct_ok || !is_direct_request( req ) || size > sizeof(data)) return 1;
++    if (!is_direct_request( req ) || size > sizeof(data)) return 1;
 +    for (i = 0; i < info->data_count && i < __SERVER_MAX_DATA; i++)
 +    {
 +        if (info->data[i].size > size - pos) return 1;

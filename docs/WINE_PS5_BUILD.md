@@ -303,6 +303,18 @@ pipes again. An older `wineserver.prx` without the export works with the new
 `ntdll.prx` and vice versa, so swapping one module is enough to compare the
 two paths.
 
+The server captures the poll-user epoch while holding its mutex, before
+letting client threads run. After waking and taking the mutex again, it
+compares that snapshot to the current epoch before using the returned
+events. The direct-request enable gate is also read under that mutex.
+Slow-request diagnostics save the request opcode before the reply replaces
+the request/reply union, so both transports report the operation requested.
+
+These synchronization and diagnostic corrections require their own console
+validation. Results from an earlier module do not validate the corrected
+pair; compare exact modules with the same translator, PE files, scene and
+profiler settings, then check the file controls and game regressions.
+
 ## User driver
 
 A title has no explorer, no display server and no driver dll, so patch 0400
