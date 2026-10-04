@@ -15,7 +15,7 @@
 #endif
 
 typedef struct Source {
-    uint8_t bytes[50];
+    uint8_t bytes[53];
 } Source;
 static unsigned maximum_mixed_lookups;
 
@@ -102,17 +102,19 @@ static void run(PwX86Engine *engine,uint32_t low,unsigned dividend,unsigned *cro
 
 int main(void)
 {
-    /* Five iterations, each with a valid 100/7 divide; both FP accumulators
-     * must survive the emitter, which may use the host XMM registers. */
-    static const uint8_t program[50]={
+    /* The high-byte memory load needs the emitter even if the re-encoder
+     * later gains division. Both FP accumulators must survive the crossing.
+     * The following mov replaces AH before the valid divide. */
+    static const uint8_t program[53]={
         0xf2,0x0f,0x10,0x16,0x66,0x0f,0x57,0xc9,0xdd,0x06,
         0xb9,0x05,0x00,0x00,0x00,0xf2,0x0f,0x58,0xca,
+        0x8a,0x66,0x04,
         0xb8,0x64,0x00,0x00,0x00,0x31,0xd2,0xbb,0x07,0x00,0x00,0x00,
-        0xf7,0xf3,0xd8,0xc0,0x49,0x75,0xe9,
+        0xf7,0xf3,0xd8,0xc0,0x49,0x75,0xe6,
         0xf2,0x0f,0x11,0x4e,0x40,0xdd,0x5e,0x48,0x89,0x46,0x50,0xc3};
     /* FP arithmetic requires the native-FP backend. Exercise the disabled
      * mode with a separate integer loop using supported emitter forms. */
-    static const uint8_t integer_program[50]={
+    static const uint8_t integer_program[53]={
         0xb9,0x05,0x00,0x00,0x00,0xb8,0x64,0x00,0x00,0x00,
         0x31,0xd2,0xbb,0x07,0x00,0x00,0x00,0xf7,0xf3,
         0x49,0x75,0xef,0x89,0x46,0x50,0xc3};
@@ -143,7 +145,7 @@ int main(void)
             assert(pw_x86_engine_set_native_fp(&engine,native_fp)==PW_OK);
             for(unsigned generation=1;generation<=3;generation++) {
                 if(generation>1)assert(pw_x86_engine_reset(&engine,generation)==PW_OK);
-                source.bytes[native_fp?20:6]=(uint8_t)(99+generation);
+                source.bytes[native_fp?23:6]=(uint8_t)(99+generation);
                 run(&engine,low,99+generation,&crossings);
                 uint64_t compiles=engine.compiles;
                 for(unsigned repeat=0;repeat<4;repeat++) {

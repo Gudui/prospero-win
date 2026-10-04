@@ -66,7 +66,7 @@ C, with the existing FP conversions and link rejection.
 `test_pw_x86_dispatch_reuse` runs bounded integer and SSE/x87 arithmetic,
 checks registers and flags, and covers cold/warm execution and code changes
 across three cache generations with FP and chaining enabled or disabled.
-Its 141 mixed crossings require at most two cache lookups, compared with
+Its mixed crossings require at most two cache lookups, compared with
 three on the previous engine. This is a lookup-count result; console frame
 rates and full gameplay regression gates need separate validation.
 
