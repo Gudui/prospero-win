@@ -19,7 +19,7 @@ diff --git a/dlls/ntdll/unix/unix_private.h b/dlls/ntdll/unix/unix_private.h
      char         signal_stack[];    /* signal stack */
      /* char kernel_stack[] */
  };
- 
+
 @@ -300,10 +301,11 @@
  extern void *get_cpu_area( struct thread_data *data, USHORT machine );
  #if defined(__x86_64__) && (defined(__PROSPERO__) || defined(WINE_INPROCESS_SERVER))
@@ -45,14 +45,14 @@ diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
 +#include "wine/ps5_sync_bop_pending.h"
  #endif
  #include "wine/debug.h"
- 
+
  WINE_DEFAULT_DEBUG_CHANNEL(unwind);
  WINE_DECLARE_DEBUG_CHANNEL(seh);
 @@ -1047,10 +1049,151 @@
      return status;
  }
- 
- 
+
+
  #if defined(__PROSPERO__) || defined(WINE_INPROCESS_SERVER)
 +/* Pending edits are recorded only for an explicitly attached CPU thread.
 + * Native host FP fixups are not guest FP changes. Neither the recorder nor
@@ -211,8 +211,8 @@ diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
 +#endif
      return STATUS_SUCCESS;
  }
- 
- 
+
+
  /***********************************************************************
 diff --git a/dlls/ntdll/unix/thread.c b/dlls/ntdll/unix/thread.c
 --- a/dlls/ntdll/unix/thread.c

@@ -666,8 +666,8 @@ or retry a committed scalar operation. The ordinary handoff remains required
 before this path can be activated.
 
 `python3 tests/test_wine_sync_bop_pending.py` executes the actual native helper
-bodies with explicit benign contexts, FP conversion and OS authority mocks. It checks all 64
-field combinations, ordered extended/legacy FP updates, preservation of the
+bodies with explicit benign contexts, FP conversion and OS authority mocks.
+It checks all 64 field combinations, ordered extended/legacy FP updates, preservation of the
 native host FP frame, retained edits across return boundaries, lease/reset
 guards and nested-record refusal. Real Wine, signals, faults, guest execution
 and console speed are outside these fixture checks. Complete SDK modules and
