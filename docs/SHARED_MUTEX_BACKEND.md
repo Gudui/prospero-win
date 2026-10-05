@@ -490,14 +490,20 @@ or either return slot follow the ordinary captured-argument order.
 
 A miss leaves guest registers, object state and output storage unchanged.
 The context callbacks must restore their prior view on a miss. A write
-refused after a successful CAS is a committed operation plus an output
-fault, never a retryable miss. If Wine replaced the context, its canonical
-registers and FP image take precedence over the ordinary success return.
+refused after a successful CAS is a committed operation plus a returned
+NTSTATUS, never a retryable miss. The protected-store callback returns zero
+on success or the exception status returned by the ordinary Wine syscall
+path. `wow64_syscall_handler` unwinds with `ExceptionCode` as the return value;
+the CPU resumes the popped continuation with that status in EAX. It must not
+raise a fresh guest exception or repeat the object operation. If Wine replaced
+the context, its canonical registers and FP image take precedence over both
+the success status and the failed-store status.
 
 `python3 tests/test_wow_sync_bop_adapter.py` compares the core against an
 independent ordinary CPU/Wow64 marshalling reference. The bounded native
 fixture checks all five operations, output aliases, misses, timeout/output
-preflight, mocked write refusal after CAS, and replacement-context/FP
+preflight, 24 mocked post-CAS NTSTATUS/reset combinations across the four
+output-producing services, and replacement-context/FP
 publication callbacks. Normal and sanitizer checks execute no Wine, guest
 program, kernel fault or console operation. Callback mocks do not establish
 Wine's asynchronous context behavior or performance.
@@ -540,7 +546,9 @@ FP-only replacements update its extended-register image while preserving SSE
 state. The original Unix native FP frame retains its native ABI role.
 
 Finish commits the popped continuation and successful EAX only when observers
-have not replaced the transaction. A clean miss preserves the prior canonical
+have not replaced the transaction. A failed output store uses the fault
+disposition with the ordinary returned NTSTATUS already in the shadow's EAX;
+finish preserves that status. A clean miss preserves the prior canonical
 context. Observer edits interrupt a copy commit; finish retries before making
 the canonical view visible. After eight interrupted attempts it uses Wine's
 existing signal set to complete the copy. Ordinary warm transactions make no

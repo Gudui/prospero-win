@@ -158,6 +158,16 @@ int main(void)
  const struct pw_sync_bop_context_backend *api=__wine_ps5_sync_bop_context_backend(PW_BOP_CONTEXT_VERSION);
  assert(api && api->context_size==sizeof(I386_CONTEXT) && api->pointer_size==sizeof(void *));
  assert(!__wine_ps5_sync_bop_context_backend(0));
+ const uint32_t output_statuses[]={0xc0000005u,0x80000001u,0xc0000006u};
+ for(unsigned i=0;i<3;i++)
+ {
+  reset(&view);original=frame.xsave;assert(api->publish(&view,sizeof(shadow)));
+  /* Caller carries the ordinary returned NTSTATUS in its complete view. */
+  shadow.Eax=output_statuses[i];
+  assert(api->finish(&view,PW_BOP_CONTEXT_FAULT)==PW_BOP_CONTEXT_UNCHANGED);
+  assert(CANONICAL.Eax==output_statuses[i] && CANONICAL.Eip==shadow.Eip && CANONICAL.Esp==shadow.Esp);
+  assert(!data.ps5_sync_bop_context && !memcmp(&original,&frame.xsave,sizeof(original)) && !blocks);
+ }
  for(unsigned disposition=0;disposition<=2;disposition++)
  {
   reset(&view);prior=CANONICAL;original=frame.xsave;

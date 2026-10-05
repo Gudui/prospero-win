@@ -12,7 +12,8 @@ struct fixture
     uint8_t guest_fp[512], native_fp[512], saved_fp[512];
     uint32_t object, op, handle, count;
     unsigned reads, probes, writes, publishes, finishes, calls;
-    int deny_read, deny_probe, deny_publish, deny_write, backend_miss, reset;
+    int deny_read, deny_probe, deny_publish, backend_miss, reset;
+    uint32_t write_status;
     unsigned published;
 };
 static struct pw_wow_sync_bindings bindings={1,{4,0x20,0xe,0xdd,0xa},1};
@@ -29,13 +30,13 @@ static int probe_guest(void *opaque,uint32_t address,size_t bytes)
     return !f->deny_probe && address>=BASE && address-BASE<=sizeof(f->memory) &&
            bytes<=sizeof(f->memory)-(address-BASE);
 }
-static int write_guest(void *opaque,uint32_t address,const void *in,size_t bytes)
+static uint32_t write_guest(void *opaque,uint32_t address,const void *in,size_t bytes)
 {
     struct fixture *f=opaque;f->writes++;
     assert(f->published && f->calls==1);
-    if(f->deny_write)return 0;
+    if(f->write_status)return f->write_status;
     assert(address>=BASE && address-BASE<=sizeof(f->memory) && bytes<=sizeof(f->memory)-(address-BASE));
-    memcpy(f->memory+(address-BASE),in,bytes);return 1;
+    memcpy(f->memory+(address-BASE),in,bytes);return 0;
 }
 static int publish(void *opaque,const struct pw_wow_sync_registers *registers)
 {
@@ -104,8 +105,15 @@ static void ordinary_reference(struct fixture *f,struct pw_wow_sync_registers *s
     case 4:f->object+=frame[3];break;
     default:assert(0);
     }
-    if(op){uint32_t output=frame[op==4?4:3];if(output)memcpy(f->memory+output-BASE,&previous,4);}
-    state->gpr[0]=0;
+    uint32_t status=0;
+    if(op){uint32_t output=frame[op==4?4:3];if(output){
+        /* Model the ordinary syscall handler's NTSTATUS return, without
+         * generating any real fault or executing Wine's exception path. */
+        if(f->write_status)status=f->write_status;
+        else memcpy(f->memory+output-BASE,&previous,4);
+    }}
+    if(f->reset){state->gpr[0]=0x991;state->pc=0x42000;state->gpr[4]=BASE+128;f->guest_fp[17]=0x39;}
+    else state->gpr[0]=status;
 }
 static void check_miss(struct fixture *f,struct pw_wow_sync_registers *state)
 {
@@ -152,10 +160,19 @@ int main(void)
         prepare(&f,&state,2);access=access_for(&f);
         assert(pw_wow_sync_try(&invalid,&access,&state,NULL)==PW_WOW_SYNC_MISS && !f.reads && !f.calls);
     }
-    prepare(&f,&state,2);f.deny_write=1;access=access_for(&f);uint32_t fault=0;
-    assert(pw_wow_sync_try(&bindings,&access,&state,&fault)==PW_WOW_SYNC_OUTPUT_FAULT);
-    assert(f.object==1 && fault==BASE+64 && state.pc==0x41000 && state.gpr[4]==BASE+4);
-    assert(state.gpr[0]==bindings.ids[2] && f.finishes==1 && !f.published);
+    const uint32_t statuses[]={0xc0000005u,0x80000001u,0xc0000006u};
+    unsigned status_cases=0;
+    for(unsigned op=1;op<5;op++)for(unsigned s=0;s<3;s++)for(unsigned reset_case=0;reset_case<2;reset_case++){
+        prepare(&f,&state,op);f.write_status=statuses[s];f.reset=reset_case;
+        reference=f;expected=state;ordinary_reference(&reference,&expected,op);
+        access=access_for(&f);uint32_t fault=0x123;
+        assert(pw_wow_sync_try(&bindings,&access,&state,&fault)==
+               (reset_case?PW_WOW_SYNC_CONTEXT_RESET:PW_WOW_SYNC_OUTPUT_STATUS));
+        assert(!memcmp(&state,&expected,sizeof(state)) && !memcmp(f.memory,reference.memory,256));
+        assert(f.object==reference.object && f.calls==1 && f.writes==1 && f.finishes==1 && !f.published);
+        assert(!memcmp(&f.canonical,&state,sizeof(state)) && f.guest_fp[17]==reference.guest_fp[17]);
+        assert(fault==(reset_case?0x123u:BASE+64));status_cases++;
+    }
     for(unsigned miss=0;miss<2;miss++){
         prepare(&f,&state,2);f.reset=1;f.backend_miss=miss;access=access_for(&f);
         assert(pw_wow_sync_try(&bindings,&access,&state,NULL)==PW_WOW_SYNC_CONTEXT_RESET);
@@ -163,6 +180,6 @@ int main(void)
         assert(f.guest_fp[17]==0x39 && f.native_fp[17]==0xab && f.finishes==1);
         assert(f.object==(miss?0u:1u));
     }
-    printf("PASS: %u ordinary-reference transactions; stack/output aliases, 25 misses, BOOLEAN truncation, timeout/output preflight, mocked post-CAS write refusal, context reset and FP publication callbacks\n",successes);
+    printf("PASS: %u ordinary-reference transactions; %u mocked post-CAS NTSTATUS/reset cases; stack/output aliases, 25 misses, BOOLEAN truncation, timeout/output preflight and FP callbacks\n",successes,status_cases);
     return 0;
 }

@@ -18,7 +18,7 @@ enum pw_wow_sync_operation
 enum pw_wow_sync_result
 {
     PW_WOW_SYNC_MISS, PW_WOW_SYNC_HIT, PW_WOW_SYNC_CONTEXT_RESET,
-    PW_WOW_SYNC_OUTPUT_FAULT
+    PW_WOW_SYNC_OUTPUT_STATUS
 };
 struct pw_wow_sync_registers
 {
@@ -37,7 +37,9 @@ struct pw_wow_sync_access
     void *opaque;
     int (*read)(void *, uint32_t, void *, size_t);
     int (*writable)(void *, uint32_t, size_t);
-    int (*write)(void *, uint32_t, const void *, size_t);
+    /* Wine's protected store returns zero on success, or the NTSTATUS that
+     * the ordinary syscall exception path would return. Never retry CAS. */
+    uint32_t (*write)(void *, uint32_t, const void *, size_t);
     /* Publish canonical GPRs plus the guest's complete FP image to Wine's
      * native syscall-frame observers. Failure restores the prior view and has no
      * semantic side effect. Pending/reset/debug contexts must decline. */
@@ -77,11 +79,11 @@ static inline enum pw_wow_sync_result pw_wow_sync_try(
     const struct pw_wow_sync_bindings *bindings, const struct pw_wow_sync_access *access,
     struct pw_wow_sync_registers *state, uint32_t *fault_address)
 {
-    uint32_t words[5], previous = 0, output = 0, count = 0;
+    uint32_t words[5], previous = 0, output = 0, count = 0, write_status = 0;
     uint64_t timeout;
     unsigned op, nwords;
     struct pw_wow_sync_registers continuation, replacement;
-    int hit, reset, wrote = 1;
+    int hit, reset;
 
     if (!state || !access || !pw_wow_sync_bindings_valid(bindings) ||
         !access->read || !access->writable || !access->write || !access->publish ||
@@ -115,29 +117,26 @@ static inline enum pw_wow_sync_result pw_wow_sync_try(
     continuation.gpr[4] += sizeof(*words);
     if (!access->publish(access->opaque, &continuation)) return PW_WOW_SYNC_MISS;
     hit = access->try_cached(access->opaque, op, words[2], count, &previous);
-    if (hit && output) wrote = access->write(access->opaque, output, &previous, sizeof(previous));
-    if (hit && wrote) continuation.gpr[0] = 0; /* STATUS_SUCCESS */
+    if (hit && output) write_status = access->write(access->opaque, output, &previous, sizeof(previous));
+    /* wow64_syscall_handler unwinds to the return path with ExceptionCode
+     * as NTSTATUS. BTCpuSimulate installs it unless RESET replaced context. */
+    if (hit) continuation.gpr[0] = write_status;
     replacement = continuation;
     reset = access->finish(access->opaque, !hit ? PW_WOW_SYNC_MISS :
-                           wrote ? PW_WOW_SYNC_HIT : PW_WOW_SYNC_OUTPUT_FAULT, &replacement);
+                           write_status ? PW_WOW_SYNC_OUTPUT_STATUS : PW_WOW_SYNC_HIT, &replacement);
     if (reset)
     {
         *state = replacement;
-        if (hit && !wrote)
-        {
-            if (fault_address) *fault_address = output;
-            return PW_WOW_SYNC_OUTPUT_FAULT;
-        }
         return PW_WOW_SYNC_CONTEXT_RESET;
     }
     if (!hit) return PW_WOW_SYNC_MISS;
     *state = continuation;
-    /* A refused output after CAS is not a miss: the object already changed.
-     * Report the write fault at the ordinary popped syscall continuation. */
-    if (!wrote)
+    /* A failed store after CAS resumes the ordinary popped continuation
+     * with its status. It must neither retry CAS nor raise a guest exception. */
+    if (write_status)
     {
         if (fault_address) *fault_address = output;
-        return PW_WOW_SYNC_OUTPUT_FAULT;
+        return PW_WOW_SYNC_OUTPUT_STATUS;
     }
     /* The ordinary popped continuation and STATUS_SUCCESS are now committed. */
     return PW_WOW_SYNC_HIT;
