@@ -81,7 +81,9 @@ TARGETS="dlls/ntdll/ntdll.so dlls/win32u/win32u.so server/wineserver dlls/winevu
 # xinput1_4. quartz: its renderers wait for a state change without the filter
 # lock (patch 0700). opengl32: it batches immediate-mode calls for its Unix
 # side (patch 0720), so its PE and Unix halves must come from the same build.
-PE_MODULES="xinput1_1 xinput1_2 xinput1_3 xinput1_4 xinputuap quartz opengl32"
+# user32: GetWindowLong(GWL_STYLE) reads the server's shared window data (patch
+# 0800), whose layout must match this build's ntdll, wineserver and win32u.
+PE_MODULES="xinput1_1 xinput1_2 xinput1_3 xinput1_4 xinputuap quartz opengl32 user32"
 # Everything optional but FreeType (built below) is off: the console has none
 # of these libraries, and a configure-time probe against the payload SDK must
 # not pick up host headers.
