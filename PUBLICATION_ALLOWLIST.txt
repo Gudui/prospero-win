@@ -377,3 +377,4 @@ tests/fixtures/wine_sync_ordinary.c
 tools/build_wine_sync_ordinary.py
 wine/patches/0888-ntdll-ps5-shared-sync-default-on.patch
 wine/patches/0890-ntdll-ps5-share-name-changes-with-the-server.patch
+wine/patches/0899-include-list-the-ps5-headers-for-makedep.patch
