@@ -502,9 +502,25 @@ publication callbacks. Normal and sanitizer checks execute no Wine, guest
 program, kernel fault or console operation. Callback mocks do not establish
 Wine's asynchronous context behavior or performance.
 
+`wine/wowprospero/sync_bop_bindings.h` checks the identities supplied from
+retained loaded PE32 and PE64 NTDLL modules. The caller resolves the same
+five named exports in both modules and provides guarded, image-bounded reads.
+The helper validates the pinned Wine stub forms, matching service IDs,
+32-bit argument sizes, shared helper target and dispatcher data-export
+bounds. It records each stub's return address and rejects duplicate IDs,
+other syscall tables, custom stubs, incomplete images and read refusals.
+At most eleven reads occur; failure leaves the destination unchanged.
+The current console Wine build uses the recognized non-PIC PE32 form;
+unrecognized forms retain ordinary dispatch.
+
+`python3 tests/test_wow_sync_bop_bindings.py` checks ordinary synthetic stub
+data, every byte of all five stub pairs, bounds and eleven mocked read
+refusals. It does not execute the stubs, load Wine or establish that an actual
+runtime has retained and resolved the required module identities.
+
 This is a dependency, not an active BOP interceptor. Remaining integration
-must validate loaded PE32 NTDLL identities against matching native and WoW64
-metadata; retain the native module; provide protected guest memory access;
+must resolve the actual loaded PE32/PE64 module identities and feed the
+attestation helper; retain both modules; provide protected guest memory access;
 and publish the complete guest FP state in Wine's native syscall frame.
 Publishing `I386_CONTEXT` alone is insufficient: pinned Wine's
 `get_thread_wow64_context` reads extended registers from `frame->xsave`.

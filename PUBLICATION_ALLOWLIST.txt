@@ -372,3 +372,6 @@ tests/fixtures/wine_sync_bop_backend.c
 wine/wowprospero/sync_bop_adapter.h
 tests/test_wow_sync_bop_adapter.py
 tests/fixtures/wow_sync_bop_adapter.c
+wine/wowprospero/sync_bop_bindings.h
+tests/test_wow_sync_bop_bindings.py
+tests/fixtures/wow_sync_bop_bindings.c
