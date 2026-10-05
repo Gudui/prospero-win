@@ -38,11 +38,11 @@ struct pw_wow_sync_access
     int (*read)(void *, uint32_t, void *, size_t);
     int (*writable)(void *, uint32_t, size_t);
     int (*write)(void *, uint32_t, const void *, size_t);
-    /* Publish canonical GPRs plus the guest's complete FP image in Wine's
-     * native syscall frame. Failure restores the prior view and has no
+    /* Publish canonical GPRs plus the guest's complete FP image to Wine's
+     * native syscall-frame observers. Failure restores the prior view and has no
      * semantic side effect. Pending/reset/debug contexts must decline. */
     int (*publish)(void *, const struct pw_wow_sync_registers *);
-    /* Restore the native FP frame. Return nonzero and supply authoritative
+    /* Restore the native observer view. Return nonzero and supply authoritative
      * registers if Wine replaced context; FP reset import is also required.
      * On MISS restore the prior canonical view, unless a reset replaced it.
      * On HIT publish the supplied successful continuation. Called exactly

@@ -1,0 +1,574 @@
+From: Prospero Win contributors <prospero-win@localhost>
+Subject: [PATCH] ntdll: prepare observer-aware native BOP context publication
+
+Publish a complete native transaction view to I386 CPU-area and Wow64 FP
+observers. Suspension serialization edits that view; copy commit detects
+interruptions and uses Wine's existing signal set only after repeated edits.
+The original Unix native FP frame stays authoritative for native ABI state.
+This is an inactive dependency: no BOP consumer or activation is added.
+
+diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -78,16 +78,19 @@
+
+ #include "ntstatus.h"
+ #include "windef.h"
+ #include "winternl.h"
+ #include "ddk/wdm.h"
+ #include "wine/list.h"
+ #include "wine/asm.h"
+ #include "unix_private.h"
++#if defined(__PROSPERO__) || defined(WINE_INPROCESS_SERVER)
++#include "wine/ps5_sync_bop_context.h"
++#endif
+ #include "wine/debug.h"
+
+ WINE_DEFAULT_DEBUG_CHANNEL(unwind);
+ WINE_DECLARE_DEBUG_CHANNEL(seh);
+
+ #include "dwarf.h"
+
+ static USHORT cs32_sel;  /* selector for %cs in 32-bit mode */
+@@ -1040,16 +1043,153 @@
+     NTSTATUS status = NtSetContextThread( GetCurrentThread(), context );
+
+     if (!status && (context->ContextFlags & CONTEXT_INTEGER) == CONTEXT_INTEGER)
+         get_syscall_frame(get_thread_data())->restore_flags |= CONTEXT_INTEGER;
+     return status;
+ }
+
+
++#if defined(__PROSPERO__) || defined(WINE_INPROCESS_SERVER)
++/* Pointer publication keeps readers off a partially copied I386 context.
++ * The caller and signal handlers execute on this thread; server observers
++ * reach the same view through the existing suspension protocol. */
++void *ps5_sync_bop_cpu_area( struct thread_data *data )
++{
++    struct pw_sync_bop_context_view *view;
++
++    if (!(view = __atomic_load_n( &data->ps5_sync_bop_context, __ATOMIC_ACQUIRE ))) return NULL;
++    if (__atomic_load_n( &view->phase, __ATOMIC_ACQUIRE ) == PW_BOP_CONTEXT_COMMITTED)
++        return (void *)(ULONG_PTR)view->canonical;
++    return (void *)(ULONG_PTR)view->shadow;
++}
++
++void ps5_sync_bop_context_edit( struct thread_data *data )
++{
++    struct pw_sync_bop_context_view *view;
++
++    if (!(view = __atomic_load_n( &data->ps5_sync_bop_context, __ATOMIC_ACQUIRE ))) return;
++    __atomic_add_fetch( &view->changes, 1, __ATOMIC_RELEASE );
++    if (__atomic_load_n( &view->phase, __ATOMIC_ACQUIRE ) != PW_BOP_CONTEXT_COMMITTED)
++        __atomic_store_n( &view->phase, PW_BOP_CONTEXT_INTERRUPTED, __ATOMIC_RELEASE );
++}
++
++void ps5_sync_bop_context_resumed( struct thread_data *data, unsigned int flags )
++{
++    I386_CONTEXT *context = ps5_sync_bop_cpu_area( data );
++
++    if (!context) return;
++    if ((flags & SERVER_CTX_FLOATING_POINT) && !(flags & SERVER_CTX_EXTENDED_REGISTERS))
++        fpu_to_fpux( (XSAVE_FORMAT *)context->ExtendedRegisters, &context->FloatSave );
++}
++
++static XSAVE_FORMAT *ps5_sync_bop_fp_area( struct thread_data *data, struct syscall_frame *frame )
++{
++    I386_CONTEXT *context = ps5_sync_bop_cpu_area( data );
++    return context ? (XSAVE_FORMAT *)context->ExtendedRegisters : &frame->xsave;
++}
++
++static int ps5_sync_bop_context_publish( struct pw_sync_bop_context_view *view, uint32_t context_size )
++{
++    struct thread_data *data = get_thread_data();
++    struct syscall_frame *frame;
++    WOW64_CPURESERVED *cpu;
++    I386_CONTEXT *shadow;
++
++    if (!view || view->version != PW_BOP_CONTEXT_VERSION || view->size != sizeof(*view) ||
++        context_size != sizeof(I386_CONTEXT) || !data || !data->teb ||
++        __atomic_load_n( &data->ps5_sync_bop_context, __ATOMIC_ACQUIRE ) ||
++        !(frame = get_syscall_frame( data )) ||
++        !(frame->restore_flags & RESTORE_FLAGS_INCOMPLETE_FRAME_CONTEXT) || frame->prev_frame ||
++        !view->canonical || !view->shadow || view->canonical == view->shadow ||
++        (void *)(ULONG_PTR)view->canonical != get_cpu_area( data, IMAGE_FILE_MACHINE_I386 ) ||
++        ((view->shadow + offsetof(I386_CONTEXT, ExtendedRegisters)) & 15) ||
++        ((view->canonical + offsetof(I386_CONTEXT, ExtendedRegisters)) & 15)) return 0;
++    cpu = data->teb->TlsSlots[WOW64_TLS_CPURESERVED];
++    shadow = (I386_CONTEXT *)(ULONG_PTR)view->shadow;
++    if ((cpu->Flags & WOW64_CPURESERVED_FLAG_RESET_STATE) || data->teb->Peb->BeingDebugged ||
++        shadow->Dr7 || (shadow->EFlags & (0x100 | 0x10000)) ||
++        (shadow->ContextFlags & CONTEXT_I386_XSTATE) == CONTEXT_I386_XSTATE) return 0;
++
++    fpux_to_fpu( &shadow->FloatSave, (const XSAVE_FORMAT *)shadow->ExtendedRegisters );
++    shadow->ContextFlags |= CONTEXT_I386_CONTROL | CONTEXT_I386_INTEGER |
++                            CONTEXT_I386_FLOATING_POINT | CONTEXT_I386_EXTENDED_REGISTERS;
++    view->changes = 0;
++    __atomic_store_n( &view->phase, PW_BOP_CONTEXT_ACTIVE, __ATOMIC_RELEASE );
++    __atomic_store_n( &data->ps5_sync_bop_context, view, __ATOMIC_RELEASE );
++    return 1;
++}
++
++static uint32_t ps5_sync_bop_context_finish( struct pw_sync_bop_context_view *view, uint32_t disposition )
++{
++    struct thread_data *data = get_thread_data();
++    WOW64_CPURESERVED *cpu;
++    I386_CONTEXT *canonical, *shadow;
++    uint32_t expected, changed;
++    unsigned int tries;
++    sigset_t previous;
++    int blocked = 0;
++
++    if (!view || !data || disposition > PW_BOP_CONTEXT_FAULT ||
++        __atomic_load_n( &data->ps5_sync_bop_context, __ATOMIC_ACQUIRE ) != view)
++        return PW_BOP_CONTEXT_INVALID;
++    cpu = data->teb->TlsSlots[WOW64_TLS_CPURESERVED];
++    canonical = (I386_CONTEXT *)(ULONG_PTR)view->canonical;
++    shadow = (I386_CONTEXT *)(ULONG_PTR)view->shadow;
++    for (tries = 0; ; tries++)
++    {
++        changed = __atomic_load_n( &view->changes, __ATOMIC_ACQUIRE );
++        if (!changed && disposition == PW_BOP_CONTEXT_MISS)
++        {
++            expected = PW_BOP_CONTEXT_ACTIVE;
++            if (__atomic_compare_exchange_n( &view->phase, &expected, PW_BOP_CONTEXT_COMMITTED,
++                                              0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE )) break;
++        }
++        else
++        {
++            if (tries == 8)
++            {
++                /* Rare observer contention only, never on an ordinary warm hit.
++                 * Once blocked, complete the snapshot under Wine's existing set. */
++                if (pthread_sigmask( SIG_BLOCK, &server_block_set, &previous ))
++                    return PW_BOP_CONTEXT_INVALID; /* caller retains view storage until recovery */
++                blocked = 1;
++            }
++            __atomic_store_n( &view->phase, PW_BOP_CONTEXT_COPYING, __ATOMIC_RELEASE );
++            memcpy( canonical, shadow, sizeof(*canonical) );
++            if (!__atomic_load_n( &view->changes, __ATOMIC_ACQUIRE ) && disposition == PW_BOP_CONTEXT_HIT)
++                canonical->Eax = STATUS_SUCCESS;
++            expected = PW_BOP_CONTEXT_COPYING;
++            if (__atomic_compare_exchange_n( &view->phase, &expected, PW_BOP_CONTEXT_COMMITTED,
++                                              0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE )) break;
++        }
++    }
++    changed = __atomic_load_n( &view->changes, __ATOMIC_ACQUIRE );
++    __atomic_store_n( &data->ps5_sync_bop_context, NULL, __ATOMIC_RELEASE );
++    if (blocked) pthread_sigmask( SIG_SETMASK, &previous, NULL );
++    return changed || (cpu->Flags & WOW64_CPURESERVED_FLAG_RESET_STATE) ?
++           PW_BOP_CONTEXT_REPLACED : PW_BOP_CONTEXT_UNCHANGED;
++}
++
++DECLSPEC_EXPORT const struct pw_sync_bop_context_backend *__wine_ps5_sync_bop_context_backend(uint32_t version)
++{
++    static const struct pw_sync_bop_context_backend api =
++    {
++        PW_BOP_CONTEXT_VERSION, sizeof(api), sizeof(void *), sizeof(I386_CONTEXT),
++        ps5_sync_bop_context_publish, ps5_sync_bop_context_finish
++    };
++    return version == PW_BOP_CONTEXT_VERSION ? &api : NULL;
++}
++#else
++static XSAVE_FORMAT *ps5_sync_bop_fp_area( struct thread_data *data, struct syscall_frame *frame )
++{
++    return &frame->xsave;
++}
++#endif
++
+ /***********************************************************************
+  *              get_native_context
+  */
+ void *get_native_context( CONTEXT *context )
+ {
+     return context;
+ }
+
+@@ -1315,16 +1455,17 @@
+  */
+ NTSTATUS set_thread_wow64_context( HANDLE handle, const void *ctx, ULONG size )
+ {
+     BOOL self = (handle == GetCurrentThread());
+     struct thread_data *data = get_thread_data();
+     struct syscall_frame *frame = get_syscall_frame( data );
+     struct amd64_thread_data *amd64_data = amd64_thread_data( data );
+     I386_CONTEXT *wow_frame;
++    XSAVE_FORMAT *fp;
+     const I386_CONTEXT *context = ctx;
+     DWORD flags = context->ContextFlags & ~CONTEXT_i386;
+
+     if (size != sizeof(I386_CONTEXT)) return STATUS_INFO_LENGTH_MISMATCH;
+     if (self && !frame) return STATUS_ACCESS_DENIED;
+
+     /* debug registers require a server call */
+     if (self && (flags & CONTEXT_I386_DEBUG_REGISTERS))
+@@ -1347,16 +1488,20 @@
+             amd64_data->dr3 = context->Dr3;
+             amd64_data->dr6 = context->Dr6;
+             amd64_data->dr7 = context->Dr7;
+         }
+         if (!(flags & ~CONTEXT_I386_DEBUG_REGISTERS)) return ret;
+     }
+
+     if (!(wow_frame = get_cpu_area( data, IMAGE_FILE_MACHINE_I386 ))) return STATUS_INVALID_PARAMETER;
++#if defined(__PROSPERO__) || defined(WINE_INPROCESS_SERVER)
++    if (flags) ps5_sync_bop_context_edit( data );
++#endif
++    fp = ps5_sync_bop_fp_area( data, frame );
+
+     if (flags & CONTEXT_I386_INTEGER)
+     {
+         wow_frame->Eax = context->Eax;
+         wow_frame->Ebx = context->Ebx;
+         wow_frame->Ecx = context->Ecx;
+         wow_frame->Edx = context->Edx;
+         wow_frame->Esi = context->Esi;
+@@ -1387,23 +1532,23 @@
+         wow_frame->Dr1 = context->Dr1;
+         wow_frame->Dr2 = context->Dr2;
+         wow_frame->Dr3 = context->Dr3;
+         wow_frame->Dr6 = context->Dr6;
+         wow_frame->Dr7 = context->Dr7;
+     }
+     if (flags & CONTEXT_I386_EXTENDED_REGISTERS)
+     {
+-        memcpy( &frame->xsave, context->ExtendedRegisters, sizeof(frame->xsave) );
+-        frame->restore_flags |= CONTEXT_FLOATING_POINT;
++        memcpy( fp, context->ExtendedRegisters, sizeof(*fp) );
++        if (fp == &frame->xsave) frame->restore_flags |= CONTEXT_FLOATING_POINT;
+     }
+     else if (flags & CONTEXT_I386_FLOATING_POINT)
+     {
+-        fpu_to_fpux( &frame->xsave, &context->FloatSave );
+-        frame->restore_flags |= CONTEXT_FLOATING_POINT;
++        fpu_to_fpux( fp, &context->FloatSave );
++        if (fp == &frame->xsave) frame->restore_flags |= CONTEXT_FLOATING_POINT;
+     }
+     if (flags & CONTEXT_I386_XSTATE)
+     {
+         CONTEXT_EX *context_ex = (CONTEXT_EX *)(context + 1);
+         XSAVE_AREA_HEADER *xs = (XSAVE_AREA_HEADER *)((char *)context_ex + context_ex->XState.Offset);
+         UINT64 mask = frame->xstate.Mask;
+
+         if (user_shared_data->XState.CompactionEnabled)
+@@ -1421,16 +1566,17 @@
+  */
+ NTSTATUS get_thread_wow64_context( HANDLE handle, void *ctx, ULONG size )
+ {
+     DWORD needed_flags;
+     struct thread_data *data = get_thread_data();
+     struct syscall_frame *frame = get_syscall_frame( data );
+     struct amd64_thread_data *amd64_data = amd64_thread_data( data );
+     I386_CONTEXT *wow_frame, *context = ctx;
++    XSAVE_FORMAT *fp;
+     BOOL self = (handle == GetCurrentThread());
+
+     if (size != sizeof(I386_CONTEXT)) return STATUS_INFO_LENGTH_MISMATCH;
+     if (self && !frame) return STATUS_ACCESS_DENIED;
+
+     needed_flags = context->ContextFlags & ~CONTEXT_i386;
+
+     /* debug registers require a server call */
+@@ -1449,16 +1595,17 @@
+             amd64_data->dr3 = context->Dr3;
+             amd64_data->dr6 = context->Dr6;
+             amd64_data->dr7 = context->Dr7;
+         }
+         if (!(needed_flags & ~CONTEXT_I386_DEBUG_REGISTERS)) return ret;
+     }
+
+     if (!(wow_frame = get_cpu_area( data, IMAGE_FILE_MACHINE_I386 ))) return STATUS_INVALID_PARAMETER;
++    fp = ps5_sync_bop_fp_area( data, frame );
+
+     if (needed_flags & CONTEXT_I386_INTEGER)
+     {
+         context->Eax = wow_frame->Eax;
+         context->Ebx = wow_frame->Ebx;
+         context->Ecx = wow_frame->Ecx;
+         context->Edx = wow_frame->Edx;
+         context->Esi = wow_frame->Esi;
+@@ -1480,22 +1627,22 @@
+         context->SegDs = ds64_sel;
+         context->SegEs = ds64_sel;
+         context->SegFs = amd64_data->fs;
+         context->SegGs = ds64_sel;
+         context->ContextFlags |= CONTEXT_I386_SEGMENTS;
+     }
+     if (needed_flags & CONTEXT_I386_EXTENDED_REGISTERS)
+     {
+-        memcpy( context->ExtendedRegisters, &frame->xsave, sizeof(context->ExtendedRegisters) );
++        memcpy( context->ExtendedRegisters, fp, sizeof(context->ExtendedRegisters) );
+         context->ContextFlags |= CONTEXT_I386_EXTENDED_REGISTERS;
+     }
+     if (needed_flags & CONTEXT_I386_FLOATING_POINT)
+     {
+-        fpux_to_fpu( &context->FloatSave, &frame->xsave );
++        fpux_to_fpu( &context->FloatSave, fp );
+         context->ContextFlags |= CONTEXT_I386_FLOATING_POINT;
+     }
+     if ((needed_flags & CONTEXT_I386_XSTATE) && xstate_extended_features)
+     {
+         CONTEXT_EX *context_ex = (CONTEXT_EX *)(context + 1);
+         XSAVE_AREA_HEADER *xstate = (XSAVE_AREA_HEADER *)((char *)context_ex + context_ex->XState.Offset);
+         UINT64 mask;
+
+diff --git a/dlls/ntdll/unix/thread.c b/dlls/ntdll/unix/thread.c
+--- a/dlls/ntdll/unix/thread.c
++++ b/dlls/ntdll/unix/thread.c
+@@ -1055,150 +1055,165 @@
+     }
+
+     case MAKELONG( IMAGE_FILE_MACHINE_ARM64, IMAGE_FILE_MACHINE_I386 ):
+     case MAKELONG( IMAGE_FILE_MACHINE_I386, IMAGE_FILE_MACHINE_ARM64 ):
+         return STATUS_SUCCESS;
+
+     default:
+         return STATUS_INVALID_PARAMETER;
+     }
+ }
+
+
+ /***********************************************************************
+  *           contexts_to_server
+  */
+ static void contexts_to_server( struct context_data server_contexts[2], CONTEXT *context )
+ {
+     unsigned int count = 0;
+     void *native_context = get_native_context( context );
+     void *wow_context = get_wow_context( context );
+
+     if (native_context)
+     {
+         context_to_server( &server_contexts[count++], native_machine, native_context, native_machine );
+         if (wow_context) context_to_server( &server_contexts[count++], main_image_info.Machine,
+                                             wow_context, main_image_info.Machine );
+         else if (native_machine != main_image_info.Machine)
+             context_to_server( &server_contexts[count++], main_image_info.Machine,
+                                native_context, native_machine );
+     }
+     else
+         context_to_server( &server_contexts[count++], native_machine,
+                            wow_context, main_image_info.Machine );
+
+     if (count < 2) memset( &server_contexts[1], 0, sizeof(server_contexts[1]) );
+ }
+
+
+ /***********************************************************************
+  *           contexts_from_server
+  */
+ static void contexts_from_server( CONTEXT *context, struct context_data server_contexts[2] )
+ {
+     void *native_context = get_native_context( context );
+     void *wow_context = get_wow_context( context );
+
+     if (native_context)
+     {
+         context_from_server( native_context, &server_contexts[0], native_machine );
+         if (wow_context)
++        {
++#if defined(__x86_64__) && (defined(__PROSPERO__) || defined(WINE_INPROCESS_SERVER))
++            ps5_sync_bop_context_edit( get_thread_data() );
++#endif
+             context_from_server( wow_context, &server_contexts[1], main_image_info.Machine );
++#if defined(__x86_64__) && (defined(__PROSPERO__) || defined(WINE_INPROCESS_SERVER))
++            ps5_sync_bop_context_resumed( get_thread_data(), server_contexts[1].flags );
++#endif
++        }
+         else
+             context_from_server( native_context, &server_contexts[1], native_machine );
+     }
+     else context_from_server( wow_context, &server_contexts[0], main_image_info.Machine );
+ }
+
+
+ /***********************************************************************
+  *           pthread_exit_wrapper
+  */
+ static DECLSPEC_NORETURN void pthread_exit_wrapper( int status )
+ {
+     struct thread_data *data = get_thread_data();
+     close( data->alert_fd );
+     close( data->wait_fd[0] );
+     close( data->wait_fd[1] );
+     close( data->reply_fd );
+     close( data->request_fd );
+     pthread_exit( UIntToPtr(status) );
+ }
+
+
+ /***********************************************************************
+  *           get_machine_context_size
+  */
+ static SIZE_T get_machine_context_size( USHORT machine )
+ {
+     switch (machine)
+     {
+     case IMAGE_FILE_MACHINE_I386:  return sizeof(I386_CONTEXT);
+     case IMAGE_FILE_MACHINE_ARMNT: return sizeof(ARM_CONTEXT);
+     case IMAGE_FILE_MACHINE_AMD64: return sizeof(AMD64_CONTEXT);
+     case IMAGE_FILE_MACHINE_ARM64: return sizeof(ARM64_NT_CONTEXT);
+     default: return 0;
+     }
+ }
+
+
+ /***********************************************************************
+  *           get_cpu_area
+  *
+  * cf. RtlWow64GetCurrentCpuArea
+  */
+ void *get_cpu_area( struct thread_data *data, USHORT machine )
+ {
+     WOW64_CPURESERVED *cpu;
+     ULONG align;
+
+     if (!is_wow64()) return NULL;
++#if defined(__x86_64__) && (defined(__PROSPERO__) || defined(WINE_INPROCESS_SERVER))
++    if (machine == IMAGE_FILE_MACHINE_I386)
++    {
++        void *view = ps5_sync_bop_cpu_area( data );
++        if (view) return view;
++    }
++#endif
+ #ifdef _WIN64
+     cpu = data->teb->TlsSlots[WOW64_TLS_CPURESERVED];
+ #else
+     cpu = ULongToPtr( get_teb64(data->teb)->TlsSlots[WOW64_TLS_CPURESERVED] );
+ #endif
+     if (cpu->Machine != machine) return NULL;
+     switch (cpu->Machine)
+     {
+     case IMAGE_FILE_MACHINE_I386: align = TYPE_ALIGNMENT(I386_CONTEXT); break;
+     case IMAGE_FILE_MACHINE_AMD64: align = TYPE_ALIGNMENT(AMD64_CONTEXT); break;
+     case IMAGE_FILE_MACHINE_ARMNT: align = TYPE_ALIGNMENT(ARM_CONTEXT); break;
+     case IMAGE_FILE_MACHINE_ARM64: align = TYPE_ALIGNMENT(ARM64_NT_CONTEXT); break;
+     default: return NULL;
+     }
+     return (void *)(((ULONG_PTR)(cpu + 1) + align - 1) & ~((ULONG_PTR)align - 1));
+ }
+
+
+ /***********************************************************************
+  *           set_thread_id
+  */
+ void set_thread_id( struct thread_data *data )
+ {
+     TEB *teb = data->teb;
+     WOW_TEB *wow_teb = get_wow_teb( teb );
+
+     teb->RealClientId = teb->ClientId = make_client_id( pid, data->tid );
+     if (wow_teb)
+     {
+         wow_teb->ClientId.UniqueProcess = pid;
+         wow_teb->ClientId.UniqueThread  = data->tid;
+         wow_teb->RealClientId = wow_teb->ClientId;
+     }
+ }
+
+
+ /***********************************************************************
+  *           init_thread_stack
+  */
+ NTSTATUS init_thread_stack( TEB *teb, ULONG_PTR limit, SIZE_T reserve_size, SIZE_T commit_size )
+ {
+     WOW_TEB *wow_teb = get_wow_teb( teb );
+     INITIAL_TEB stack;
+     NTSTATUS status;
+
+     if (wow_teb)
+     {
+         WOW64_CPURESERVED *cpu;
+         SIZE_T cpusize = sizeof(WOW64_CPURESERVED) +
+             ((get_machine_context_size( main_image_info.Machine ) + 7) & ~7) + sizeof(ULONG64);
+diff --git a/dlls/ntdll/unix/unix_private.h b/dlls/ntdll/unix/unix_private.h
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -118,16 +118,19 @@
+     ULONGLONG    ps5_spawn_us;      /* WINE_PS5_WAIT_WATCHDOG: when spawn_thread created it */
+     ULONGLONG    ps5_sleep_since;   /* WINE_PS5_WAIT_WATCHDOG: NtDelayExecution calls since */
+     unsigned int ps5_sleeps;
+ #if defined(__PROSPERO__) || defined(WINE_INPROCESS_SERVER)
+     unsigned int ps5_mutex_token; /* occupies the padding before ps5_sleep_asked on x86_64 */
+ #endif
+     LONGLONG     ps5_sleep_asked;   /* microseconds of sleep asked since then */
+     char         debug_info[0x800]; /* debug_info structure */
++#if defined(__x86_64__) && (defined(__PROSPERO__) || defined(WINE_INPROCESS_SERVER))
++    void        *ps5_sync_bop_context; /* atomic native transaction view, normally NULL */
++#endif
+     char         signal_stack[];    /* signal stack */
+     /* char kernel_stack[] */
+ };
+
+ extern pthread_key_t thread_data_key;
+
+ static inline struct thread_data *get_thread_data(void)
+ {
+@@ -289,16 +292,21 @@
+ }
+
+ extern unsigned int xstate_get_size( UINT64 compaction_mask, UINT64 mask );
+ extern void copy_xstate( XSAVE_AREA_HEADER *dst, XSAVE_AREA_HEADER *src, UINT64 mask );
+
+ extern void set_process_instrumentation_callback( void *callback );
+
+ extern void *get_cpu_area( struct thread_data *data, USHORT machine );
++#if defined(__x86_64__) && (defined(__PROSPERO__) || defined(WINE_INPROCESS_SERVER))
++extern void *ps5_sync_bop_cpu_area( struct thread_data *data );
++extern void ps5_sync_bop_context_edit( struct thread_data *data );
++extern void ps5_sync_bop_context_resumed( struct thread_data *data, unsigned int flags );
++#endif
+ extern void set_thread_id( struct thread_data *data );
+ extern NTSTATUS init_thread_stack( TEB *teb, ULONG_PTR limit, SIZE_T reserve_size, SIZE_T commit_size );
+ extern void DECLSPEC_NORETURN abort_thread( int status );
+ extern void DECLSPEC_NORETURN abort_process( int status );
+ extern void DECLSPEC_NORETURN exit_process( int status );
+ extern void wait_suspend( CONTEXT *context );
+ extern NTSTATUS send_debug_event( struct thread_data *data, EXCEPTION_RECORD *rec,
+                                   CONTEXT *context, BOOL first_chance, BOOL exception );
+diff --git a/include/wine/ps5_sync_bop_context.h b/include/wine/ps5_sync_bop_context.h
+new file mode 100644
+--- /dev/null
++++ b/include/wine/ps5_sync_bop_context.h
+@@ -0,0 +1,41 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/* Native-only observer-aware I386 context publication; no guest pointers. */
++#ifndef __WINE_PS5_SYNC_BOP_CONTEXT_H
++#define __WINE_PS5_SYNC_BOP_CONTEXT_H
++#include <stdint.h>
++#define PW_BOP_CONTEXT_VERSION 1u
++#define PW_BOP_CONTEXT_EMPTY 0u
++#define PW_BOP_CONTEXT_ACTIVE 1u
++#define PW_BOP_CONTEXT_COPYING 2u
++#define PW_BOP_CONTEXT_INTERRUPTED 3u
++#define PW_BOP_CONTEXT_COMMITTED 4u
++#define PW_BOP_CONTEXT_MISS 0u
++#define PW_BOP_CONTEXT_HIT 1u
++#define PW_BOP_CONTEXT_FAULT 2u
++#define PW_BOP_CONTEXT_UNCHANGED 0u
++#define PW_BOP_CONTEXT_REPLACED 1u
++#define PW_BOP_CONTEXT_INVALID 2u
++
++/* Caller-owned native storage, valid through finish. shadow is a complete
++ * I386_CONTEXT snapshot including FP; observers may replace it. The API
++ * preserves the original Unix native FP frame and publishes the shadow to
++ * all I386 CPU-area and native Wow64 FP observers. */
++struct pw_sync_bop_context_view
++{
++    uint32_t version, size, phase, changes;
++    uint64_t canonical, shadow;
++};
++
++struct pw_sync_bop_context_backend
++{
++    uint32_t version, size, pointer_size, context_size;
++    int (*publish)(struct pw_sync_bop_context_view *, uint32_t context_size);
++    /* Caller supplies the popped continuation in shadow before publication.
++     * HIT commits successful EAX only if observers have not replaced it.
++     * A clean MISS restores the prior canonical view. FAULT commits the
++     * popped continuation; it never changes an already completed CAS into
++     * a retryable miss. REPLACED imports canonical GPR/FP after finish.
++     * Always recheck the CPU RESET flag before resuming guest execution. */
++    uint32_t (*finish)(struct pw_sync_bop_context_view *, uint32_t disposition);
++};
++#endif

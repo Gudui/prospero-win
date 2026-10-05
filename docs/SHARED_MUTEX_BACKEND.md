@@ -529,3 +529,36 @@ Context reset, callbacks, native-frame restoration, diagnostics accounting
 and ordinary fallback must remain correct before the run loop consumes the
 transaction core. No activation or FPS gain is claimed by this dependency.
 The full city58/50, load, HL2/clean Wine-exit and stability goal remains open.
+
+### Native BOP context publication dependency
+
+Patch 0891 exports a versioned native context interface. A caller supplies a
+complete, aligned transaction-local `I386_CONTEXT`, valid until finish. An
+atomic pointer publishes it through `get_cpu_area` and the native Wow64 FP
+get/set observers. Suspension serialization edits the same context. Legacy
+FP-only replacements update its extended-register image while preserving SSE
+state. The original Unix native FP frame retains its native ABI role.
+
+Finish commits the popped continuation and successful EAX only when observers
+have not replaced the transaction. A clean miss preserves the prior canonical
+context. Observer edits interrupt a copy commit; finish retries before making
+the canonical view visible. After eight interrupted attempts it uses Wine's
+existing signal set to complete the copy. Ordinary warm transactions make no
+signal-mask calls. A mocked mask refusal returns an explicit invalid result
+with the view still published: the caller must retain its storage and recover,
+and must never retry an already committed object operation. The consumer must
+also recheck Wine's CPU reset flag before resuming guest execution.
+
+`python3 tests/test_wine_sync_bop_context.py` compiles actual publication,
+finish, FP-view and CPU-area bodies against explicit native mocks. It checks
+clean hit/miss/fault dispositions, deterministic observer edits at active,
+partial-copy and committed phases, legacy/extended FP updates, repeated-edit
+mask fallback and bounded mocked failure recovery. The context layout, FP
+conversion and OS calls in that fixture are mocks; full SDK compilation and
+ordinary console context/UI/sync gates remain necessary. No real signal,
+Wine process, guest code or kernel fault is executed by these checks.
+
+This interface remains inactive. CPU-loaded module binding, protected guest
+access, run-loop/reset/diagnostic integration and complete console semantic,
+performance, load and stability gates are still required. Native component
+checks do not establish a speed gain or meet the city58/50 goal.
