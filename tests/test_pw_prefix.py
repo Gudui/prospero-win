@@ -381,6 +381,42 @@ def check_console_user(root: Path) -> None:
     assert not (console / REMOTE_PREFIX / "drive_c/users/prospero/AppData").exists()
 
 
+def check_ftp_without_self() -> None:
+    """Connecting asks ftpsrv to stop converting SELF containers; a server
+    without that command (zftpd answers 500) is used as it is."""
+    import ftplib
+
+    class FakeFtp:
+        replies: list[object] = []
+        sent: list[str] = []
+
+        def connect(self, host, port, timeout):
+            pass
+
+        def login(self):
+            pass
+
+        def sendcmd(self, command):
+            self.sent.append(command)
+            reply = self.replies.pop(0)
+            if isinstance(reply, Exception):
+                raise reply
+            return reply
+
+    real = pw_prefix.ftplib.FTP
+    pw_prefix.ftplib.FTP = FakeFtp
+    try:
+        for replies, expected in (
+                ([ftplib.error_perm("500 Unknown command.")], ["SELF"]),
+                (["200 SELF conversion disabled"], ["SELF"]),
+                (["200 SELF conversion enabled", "200 SELF conversion disabled"], ["SELF", "SELF"])):
+            FakeFtp.replies, FakeFtp.sent = list(replies), []
+            pw_prefix.FtpRemote("console", 2121)
+            assert FakeFtp.sent == expected, (replies, FakeFtp.sent)
+    finally:
+        pw_prefix.ftplib.FTP = real
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
@@ -461,6 +497,7 @@ def main() -> int:
         check_trust_size(root)
         check_ps5upload(root)
         check_console_user(root)
+    check_ftp_without_self()
     print("pw_prefix passed")
     return 0
 

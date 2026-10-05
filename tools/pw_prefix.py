@@ -140,9 +140,14 @@ class FtpRemote:
         self.ftp.connect(host, port, 30)
         self.ftp.login()
         self.made: set[str] = set()
-        # ftpsrv converts SELF containers on the fly unless told not to.
+        # ftpsrv converts SELF containers on the fly unless told not to. A
+        # server without the command (zftpd answers 500) converts nothing.
         for _ in range(2):
-            if "disabled" in self.ftp.sendcmd("SELF").lower():
+            try:
+                reply = self.ftp.sendcmd("SELF")
+            except ftplib.error_perm:
+                break
+            if "disabled" in reply.lower():
                 break
 
     def listdir(self, path: str) -> dict[str, tuple[str, int]]:
