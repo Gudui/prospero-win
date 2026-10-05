@@ -40,6 +40,13 @@
 #include "thread_budget.h"
 #include "tsc_clock.h"
 #include "host_memory.h"
+#ifdef __PROSPERO__
+#include "wine/ps5_sync_bop.h"
+#include "wine/ps5_sync_bop_context.h"
+#include "wine/ps5_sync_bop_memory.h"
+#include "wine/ps5_sync_bop_pending.h"
+#include "sync_bop_bindings.h"
+#endif
 
 /* The guest range every translated access is checked against (load_state). */
 enum { GUEST_LOW = 0x10000u, GUEST_HIGH = 0xfffff000u };
@@ -81,6 +88,20 @@ struct pw_thread
     PwX86HotspotProfile *profile;
     uint64_t profile_last_tsc;  /* TSC at the last report (tsc_clock.h) */
     uint64_t execution_clock_cost, execution_clock_resolution;
+#ifdef __PROSPERO__
+    DECLSPEC_ALIGN(16) struct pw_sync_bop_pending_view sync_pending;
+    struct pw_sync_bop_memory_view sync_memory;
+    struct pw_sync_bop_context_view sync_context;
+    DECLSPEC_ALIGN(16) BYTE sync_image[sizeof(I386_CONTEXT) + 16];
+    I386_CONTEXT *sync_canonical;
+    USHORT *sync_cpu_flags;
+    int sync_attached, sync_fatal, sync_published, sync_backend_called, sync_committed;
+    unsigned sync_operation, sync_wait_slot;
+    uint64_t sync_attempts[5], sync_hits[5], sync_preflight_misses[5];
+    uint64_t sync_backend_misses[5], sync_output_statuses[5], sync_lease_misses[5];
+    uint64_t sync_resets, sync_report_tsc, sync_wait_overflow;
+    struct { uint32_t used, handle; uint64_t calls, hits, misses, alertable, infinite; } sync_wait[16];
+#endif
 };
 
 C_ASSERT( sizeof(((I386_CONTEXT *)0)->ExtendedRegisters) == PW_GUEST_FXSAVE_BYTES );
@@ -865,22 +886,19 @@ static void register_arena( struct pw_thread *thread, int add )
 }
 
 #ifdef __PROSPERO__
-#include "wine/ps5_sync_bop.h"
-#include "wine/ps5_sync_bop_context.h"
-#include "wine/ps5_sync_bop_memory.h"
-#include "sync_bop_bindings.h"
-
 extern const struct pw_sync_bop_backend *__wine_ps5_sync_bop_backend(uint32_t);
 extern const struct pw_sync_bop_context_backend *__wine_ps5_sync_bop_context_backend(uint32_t);
 extern const struct pw_sync_bop_memory_backend *__wine_ps5_sync_bop_memory_backend(uint32_t);
+extern const struct pw_sync_bop_pending_backend *__wine_ps5_sync_bop_pending_backend(uint32_t);
 
 static const struct pw_sync_bop_backend *sync_backend;
 static const struct pw_sync_bop_context_backend *sync_context;
 static const struct pw_sync_bop_memory_backend *sync_memory;
+static const struct pw_sync_bop_pending_backend *sync_pending;
 static struct pw_wow_sync_attestation sync_attestation;
 /* Persistent storage also survives a mocked OS cleanup refusal. */
 static struct pw_sync_bop_memory_view sync_init_memory;
-static int sync_bound;
+static int sync_bound, sync_diagnostics;
 
 static int sync_requested(void)
 {
@@ -891,6 +909,22 @@ static int sync_requested(void)
 
     if (value) return !strcmp( value, "1" );
     if (!(file = fopen( "/data/prospero-win/pw_wow_sync_bop", "rb" ))) return 0;
+    count = fread( bytes, 1, sizeof(bytes), file );
+    if (ferror(file)) count = 0;
+    fclose( file );
+    return (count == 1 && bytes[0] == '1') ||
+           (count == 2 && bytes[0] == '1' && bytes[1] == '\n');
+}
+
+static int sync_diagnostics_requested(void)
+{
+    const char *value = getenv( "PW_WOW_SYNC_BOP_DIAGNOSTICS" );
+    char bytes[3];
+    FILE *file;
+    size_t count;
+
+    if (value) return !strcmp( value, "1" );
+    if (!(file = fopen( "/data/prospero-win/pw_wow_sync_bop_diagnostics", "rb" ))) return 0;
     count = fread( bytes, 1, sizeof(bytes), file );
     if (ferror(file)) count = 0;
     fclose( file );
@@ -954,7 +988,7 @@ static NTSTATUS sync_loaded_init( const struct pw_wow_init_params *params )
     unsigned i;
     int accepted = 0;
 
-    sync_bound = 0;
+    sync_bound = sync_diagnostics = 0;
     if (!sync_requested()) return STATUS_SUCCESS;
     if (!params || params->version != PW_WOW_INIT_VERSION || params->size != sizeof(*params) ||
         !params->retained64 || !params->module64 || !params->module64_size ||
@@ -962,14 +996,19 @@ static NTSTATUS sync_loaded_init( const struct pw_wow_init_params *params )
     sync_backend = __wine_ps5_sync_bop_backend( PW_SYNC_BOP_VERSION );
     sync_context = __wine_ps5_sync_bop_context_backend( PW_BOP_CONTEXT_VERSION );
     sync_memory = __wine_ps5_sync_bop_memory_backend( PW_BOP_MEMORY_VERSION );
-    if (!pw_sync_bop_backend_valid(sync_backend) || !sync_context || !sync_memory ||
+    sync_pending = __wine_ps5_sync_bop_pending_backend( PW_BOP_PENDING_VERSION );
+    if (!pw_sync_bop_backend_valid(sync_backend) || !sync_context || !sync_memory || !sync_pending ||
         sync_context->version != PW_BOP_CONTEXT_VERSION || sync_context->size != sizeof(*sync_context) ||
         sync_context->pointer_size != sizeof(void *) || sync_context->context_size != sizeof(I386_CONTEXT) ||
         !sync_context->publish || !sync_context->finish ||
         sync_memory->version != PW_BOP_MEMORY_VERSION || sync_memory->size != sizeof(*sync_memory) ||
         sync_memory->pointer_size != sizeof(void *) || sync_memory->view_size != sizeof(sync_init_memory) ||
         !sync_memory->begin || !sync_memory->end || !sync_memory->read ||
-        !sync_memory->writable || !sync_memory->write) goto disabled;
+        !sync_memory->writable || !sync_memory->write ||
+        sync_pending->version != PW_BOP_PENDING_VERSION || sync_pending->size != sizeof(*sync_pending) ||
+        sync_pending->pointer_size != sizeof(void *) ||
+        sync_pending->view_size != sizeof(struct pw_sync_bop_pending_view) ||
+        !sync_pending->attach || !sync_pending->take || !sync_pending->detach || !sync_pending->checkpoint) goto disabled;
     sync_init_memory.version = PW_BOP_MEMORY_VERSION;
     sync_init_memory.size = sizeof(sync_init_memory);
     begun = sync_memory->begin( &sync_init_memory );
@@ -1001,7 +1040,8 @@ static NTSTATUS sync_loaded_init( const struct pw_wow_init_params *params )
     if (!accepted) goto disabled;
     sync_attestation = candidate;
     sync_bound = 1;
-    fprintf( stderr, "wowprospero sync BOP: loaded identities bound (consumer inactive)\n" );
+    sync_diagnostics = sync_diagnostics_requested();
+    fprintf( stderr, "wowprospero sync BOP: loaded identities bound (consumer configured)\n" );
     return STATUS_SUCCESS;
 disabled:
     fprintf( stderr, "wowprospero sync BOP: ordinary fallback (binding unavailable)\n" );
@@ -1181,6 +1221,340 @@ static void reset_thread_engine( struct pw_thread *thread )
         thread->cache_publishes_at_reset = thread->engine.cache.publishes;
 }
 
+#ifdef __PROSPERO__
+/* Caller-owned views remain valid across Unix/PE boundaries and on refusal. */
+static I386_CONTEXT *sync_shadow( struct pw_thread *thread )
+{
+    return (I386_CONTEXT *)(thread->sync_image +
+                           ((16 - offsetof(I386_CONTEXT,ExtendedRegisters) % 16) % 16));
+}
+
+static void sync_snapshot( struct pw_thread *thread, I386_CONTEXT *ctx )
+{
+    I386_CONTEXT *image = sync_shadow(thread);
+    pw_x86_commit_canonical_flags(&thread->state);
+    memcpy(image,ctx,sizeof(*image));
+    store_state(&thread->state,image);
+    sync_fp_out(thread,image);
+}
+
+static int sync_pending_changes( const struct pw_thread *thread )
+{
+    return __atomic_load_n(&thread->sync_pending.fields,__ATOMIC_ACQUIRE) ||
+           (__atomic_load_n(thread->sync_cpu_flags,__ATOMIC_ACQUIRE) & WOW64_CPURESERVED_FLAG_RESET_STATE);
+}
+
+static int sync_memory_begin( struct pw_thread *thread )
+{
+    uint32_t begun;
+    if (thread->sync_memory.state != PW_BOP_MEMORY_EMPTY) { thread->sync_fatal=1; return 0; }
+    thread->sync_memory.version=PW_BOP_MEMORY_VERSION;
+    thread->sync_memory.size=sizeof(thread->sync_memory);
+    begun=sync_memory->begin(&thread->sync_memory);
+    if (begun==PW_BOP_MEMORY_HELD) return 1;
+    if (begun!=PW_BOP_MEMORY_EMPTY && !sync_loaded_end(&thread->sync_memory)) thread->sync_fatal=1;
+    return 0;
+}
+
+static int sync_attach( struct pw_thread *thread, I386_CONTEXT *ctx, struct pw_wow_run_params *params )
+{
+    if (!sync_bound) return 0;
+    params->sync_active=0; /* Version 2 was negotiated by initialization. */
+    if (thread->sync_attached)
+    {
+        if (thread->sync_pending.canonical!=(ULONG_PTR)ctx ||
+            thread->sync_cpu_flags!=(USHORT *)(ULONG_PTR)params->cpu_flags) thread->sync_fatal=1;
+    }
+    else if (params->cpu_flags && !ctx->Dr7 && !(ctx->EFlags & (0x100|0x10000)) &&
+             (ctx->ContextFlags & CONTEXT_I386_XSTATE)!=CONTEXT_I386_XSTATE && sync_memory_begin(thread))
+    {
+        thread->sync_pending.version=PW_BOP_PENDING_VERSION;
+        thread->sync_pending.size=sizeof(thread->sync_pending);
+        thread->sync_pending.canonical=(ULONG_PTR)ctx;
+        thread->sync_attached=sync_pending->attach(&thread->sync_pending,sizeof(*ctx));
+        thread->sync_cpu_flags=(USHORT *)(ULONG_PTR)params->cpu_flags;
+        if (!sync_loaded_end(&thread->sync_memory)) thread->sync_fatal=1;
+    }
+    thread->sync_canonical=ctx;
+    params->sync_active=thread->sync_attached;
+    return thread->sync_fatal ? -1 : thread->sync_attached;
+}
+
+/* Rare observer edits and incomplete native frames need only a native
+ * context checkpoint, never a guest-VM lock. Recovery is bounded. */
+static int sync_checkpoint( struct pw_thread *thread, I386_CONTEXT *ctx, UINT teb32, int commit )
+{
+    unsigned attempt;
+    int replaced=0;
+    uint32_t result;
+    if (!commit && !sync_pending_changes(thread)) return 0;
+    for (attempt=0;attempt<8;attempt++)
+    {
+        sync_snapshot(thread,ctx);
+        result=sync_pending->checkpoint(&thread->sync_pending,sync_shadow(thread),sizeof(*ctx));
+        if (result==PW_BOP_PENDING_INVALID)
+        {
+            if (thread->sync_pending.guard) continue; /* restore only */
+            thread->sync_fatal=1; return -1;
+        }
+        replaced|=result==PW_BOP_PENDING_REPLACED;
+        load_state(&thread->state,ctx,teb32); sync_fp_in(thread,ctx);
+        if (!sync_pending_changes(thread)) return replaced;
+    }
+    thread->sync_fatal=1;
+    return -1;
+}
+
+static int sync_revalidate( struct pw_thread *thread, unsigned op, UINT bop )
+{
+    static const BYTE args[]={12,8,8,8,12};
+    BYTE expected[15]={0xb8,0,0,0,0,0xba,0,0,0,0,0xff,0xd2,0xc2,0,0};
+    BYTE stub[15],helper[6],dispatcher[4];
+    uint32_t id=sync_attestation.bindings.ids[op],target=sync_attestation.helper32;
+    unsigned i;
+    for(i=0;i<4;i++) { expected[1+i]=(BYTE)(id>>(8*i)); expected[6+i]=(BYTE)(target>>(8*i)); }
+    expected[13]=args[op];
+    if (!sync_memory->read(&thread->sync_memory,sync_attestation.continuations[op]-12,stub,sizeof(stub)) ||
+        memcmp(stub,expected,sizeof(stub)) ||
+        !sync_memory->read(&thread->sync_memory,target,helper,sizeof(helper)) ||
+        helper[0]!=0xff || helper[1]!=0x25 || pw_wow_sync_read_le32(helper+2)!=sync_attestation.dispatcher32 ||
+        !sync_memory->read(&thread->sync_memory,sync_attestation.dispatcher32,dispatcher,sizeof(dispatcher)) ||
+        pw_wow_sync_read_le32(dispatcher)!=bop) return 0;
+    return 1;
+}
+
+static int sync_read( void *opaque, uint32_t address, void *out, size_t bytes )
+{
+    struct pw_thread *thread=opaque;
+    uint32_t *words=out;
+    if (bytes>PW_BOP_MEMORY_MAX_BYTES || !sync_memory->read(&thread->sync_memory,address,out,(uint32_t)bytes)) return 0;
+    if (address==thread->state.gpr[4] && (bytes==16 || bytes==20))
+    {
+        if (words[0]!=sync_attestation.continuations[thread->sync_operation]) return 0;
+        if (sync_diagnostics && thread->sync_operation==PW_WOW_SYNC_WAIT)
+        {
+            unsigned i;
+            for(i=0;i<16;i++) if (!thread->sync_wait[i].used || thread->sync_wait[i].handle==words[2]) break;
+            thread->sync_wait_slot=i;
+            if(i<16)
+            {
+                thread->sync_wait[i].used=1;thread->sync_wait[i].handle=words[2];thread->sync_wait[i].calls++;
+                if((BYTE)words[3]) thread->sync_wait[i].alertable++;
+                if(!words[4]) thread->sync_wait[i].infinite++;
+            }
+            else thread->sync_wait_overflow++;
+        }
+    }
+    return 1;
+}
+
+static int sync_writable( void *opaque, uint32_t address, size_t bytes )
+{
+    struct pw_thread *thread=opaque;
+    return bytes<=PW_BOP_MEMORY_MAX_BYTES && sync_memory->writable(&thread->sync_memory,address,(uint32_t)bytes);
+}
+
+static uint32_t sync_write( void *opaque, uint32_t address, const void *value, size_t bytes )
+{
+    struct pw_thread *thread=opaque;
+    return bytes<=PW_BOP_MEMORY_MAX_BYTES ? sync_memory->write(&thread->sync_memory,address,value,(uint32_t)bytes) : STATUS_ACCESS_VIOLATION;
+}
+
+static void sync_registers( const I386_CONTEXT *ctx, struct pw_wow_sync_registers *regs )
+{
+    regs->gpr[0]=ctx->Eax;regs->gpr[1]=ctx->Ecx;regs->gpr[2]=ctx->Edx;regs->gpr[3]=ctx->Ebx;
+    regs->gpr[4]=ctx->Esp;regs->gpr[5]=ctx->Ebp;regs->gpr[6]=ctx->Esi;regs->gpr[7]=ctx->Edi;
+    regs->pc=ctx->Eip;regs->flags=ctx->EFlags;
+}
+
+static int sync_publish( void *opaque, const struct pw_wow_sync_registers *regs )
+{
+    struct pw_thread *thread=opaque;
+    I386_CONTEXT *image;
+    sync_snapshot(thread,thread->sync_canonical);image=sync_shadow(thread);
+    image->Eax=regs->gpr[0];image->Ecx=regs->gpr[1];image->Edx=regs->gpr[2];image->Ebx=regs->gpr[3];
+    image->Esp=regs->gpr[4];image->Ebp=regs->gpr[5];image->Esi=regs->gpr[6];image->Edi=regs->gpr[7];
+    image->Eip=regs->pc;image->EFlags=regs->flags;
+    thread->sync_context=(struct pw_sync_bop_context_view){PW_BOP_CONTEXT_VERSION,sizeof(thread->sync_context),0,0,
+                                                       (ULONG_PTR)thread->sync_canonical,(ULONG_PTR)image};
+    thread->sync_published=sync_context->publish(&thread->sync_context,sizeof(*image));
+    return thread->sync_published;
+}
+
+static int sync_cached( void *opaque, uint32_t op, uint32_t handle, uint32_t count, uint32_t *previous )
+{
+    struct pw_thread *thread=opaque;
+    int hit=sync_backend->try_cached(op,handle,count,previous);
+    thread->sync_backend_called=1;thread->sync_committed=hit;
+    if(sync_diagnostics)
+    {
+        if(hit) thread->sync_hits[op]++; else thread->sync_backend_misses[op]++;
+        if(op==PW_WOW_SYNC_WAIT && thread->sync_wait_slot<16)
+        {
+            if(hit) thread->sync_wait[thread->sync_wait_slot].hits++;
+            else thread->sync_wait[thread->sync_wait_slot].misses++;
+        }
+    }
+    return hit;
+}
+
+static int sync_finish( void *opaque, enum pw_wow_sync_result result, struct pw_wow_sync_registers *regs )
+{
+    struct pw_thread *thread=opaque;
+    I386_CONTEXT *image=sync_shadow(thread);
+    uint32_t done;
+    /* Signals are still blocked. A miss has no completed service: queued
+     * observers must see the original BOP/stack, not a popped continuation. */
+    if(result==PW_WOW_SYNC_MISS) sync_snapshot(thread,thread->sync_canonical);
+    else if(!thread->sync_context.changes) image->Eax=regs->gpr[0];
+    if(!sync_loaded_end(&thread->sync_memory)) { thread->sync_fatal=1;return 1; }
+    done=sync_context->finish(&thread->sync_context,result==PW_WOW_SYNC_MISS ? PW_BOP_CONTEXT_MISS :
+                              result==PW_WOW_SYNC_OUTPUT_STATUS ? PW_BOP_CONTEXT_FAULT : PW_BOP_CONTEXT_HIT);
+    if(done==PW_BOP_CONTEXT_INVALID) { thread->sync_fatal=1;return 1; }
+    thread->sync_published=0;
+    if(done==PW_BOP_CONTEXT_REPLACED || sync_pending_changes(thread))
+    {
+        sync_registers(thread->sync_canonical,regs);
+        return 1;
+    }
+    return 0;
+}
+
+static int sync_try( struct pw_thread *thread, I386_CONTEXT *ctx, struct pw_wow_run_params *params )
+{
+    struct pw_wow_sync_access access={thread,sync_read,sync_writable,sync_write,sync_publish,sync_finish,sync_cached};
+    struct pw_wow_sync_registers regs;
+    enum pw_wow_sync_result result;
+    unsigned op;
+    uint32_t ignored=0;
+    int replaced;
+    for(op=0;op<PW_WOW_SYNC_OPERATIONS;op++) if(thread->state.gpr[0]==sync_attestation.bindings.ids[op]) break;
+    if(op==PW_WOW_SYNC_OPERATIONS) return 0;
+    if(sync_diagnostics) thread->sync_attempts[op]++;
+    thread->sync_operation=op;thread->sync_wait_slot=16;
+    thread->sync_canonical=ctx;thread->sync_backend_called=thread->sync_committed=0;
+    if(!sync_memory_begin(thread))
+    {
+        if(sync_diagnostics) thread->sync_lease_misses[op]++;
+        return thread->sync_fatal ? -1 : 0;
+    }
+    if(sync_pending_changes(thread))
+    {
+        if(!sync_loaded_end(&thread->sync_memory)) { thread->sync_fatal=1;return -1; }
+        replaced=sync_checkpoint(thread,ctx,params->teb32,0);
+        return replaced<0 ? -1 : 1;
+    }
+    if(!sync_revalidate(thread,op,params->bop))
+    {
+        if(!sync_loaded_end(&thread->sync_memory)) thread->sync_fatal=1;
+        if(sync_diagnostics) thread->sync_preflight_misses[op]++;
+        return thread->sync_fatal ? -1 : 0;
+    }
+    pw_x86_commit_canonical_flags(&thread->state);
+    memcpy(regs.gpr,thread->state.gpr,sizeof(regs.gpr));regs.pc=thread->state.eip;
+    regs.flags=(ctx->EFlags & ~0xcd5u)|(thread->state.eflags & 0xcd5u);
+    result=pw_wow_sync_try(&sync_attestation.bindings,&access,&regs,&ignored);
+    if(thread->sync_fatal) return -1;
+    if(!thread->sync_published && thread->sync_memory.state!=PW_BOP_MEMORY_EMPTY)
+        if(!sync_loaded_end(&thread->sync_memory)) { thread->sync_fatal=1;return -1; }
+    if(result==PW_WOW_SYNC_MISS)
+    {
+        if(sync_diagnostics && !thread->sync_backend_called) thread->sync_preflight_misses[op]++;
+        return 0;
+    }
+    if(sync_diagnostics && result==PW_WOW_SYNC_OUTPUT_STATUS) thread->sync_output_statuses[op]++;
+    /* Native finish owns the complete image, including observer FP changes. */
+    load_state(&thread->state,ctx,params->teb32);sync_fp_in(thread,ctx);
+    if(result==PW_WOW_SYNC_CONTEXT_RESET)
+    {
+        if(sync_diagnostics) thread->sync_resets++;
+        if(sync_checkpoint(thread,ctx,params->teb32,0)<0) return -1;
+    }
+    return 1;
+}
+
+static int sync_leave( struct pw_thread *thread, I386_CONTEXT *ctx, struct pw_wow_run_params *params )
+{
+    I386_CONTEXT *image;
+    uint32_t done;
+    int replaced=0;
+    if(sync_pending_changes(thread)) replaced=sync_checkpoint(thread,ctx,params->teb32,1);
+    else
+    {
+        sync_snapshot(thread,ctx);image=sync_shadow(thread);
+        thread->sync_context=(struct pw_sync_bop_context_view){PW_BOP_CONTEXT_VERSION,sizeof(thread->sync_context),0,0,
+                                                            (ULONG_PTR)ctx,(ULONG_PTR)image};
+        thread->sync_published=sync_context->publish(&thread->sync_context,sizeof(*ctx));
+        if(thread->sync_published)
+        {
+            /* FAULT means commit supplied EAX, with no success-status rewrite. */
+            done=sync_context->finish(&thread->sync_context,PW_BOP_CONTEXT_FAULT);
+            if(done==PW_BOP_CONTEXT_INVALID) { thread->sync_fatal=1;return -1; }
+            thread->sync_published=0;replaced=done==PW_BOP_CONTEXT_REPLACED;
+            load_state(&thread->state,ctx,params->teb32);sync_fp_in(thread,ctx);
+        }
+        else replaced=sync_checkpoint(thread,ctx,params->teb32,1);
+    }
+    if(replaced<0) return -1;
+    if(sync_pending_changes(thread))
+    {
+        int more=sync_checkpoint(thread,ctx,params->teb32,1);
+        if(more<0) return -1;
+        replaced|=more;
+    }
+    if(replaced || sync_pending_changes(thread)) params->reason=PW_WOW_RESET;
+    return 0;
+}
+
+static void sync_report( struct pw_thread *thread, unsigned final )
+{
+    uint64_t now;
+    unsigned op,i;
+    if(!sync_diagnostics || !thread->sync_attached) return;
+    now=__rdtsc();
+    if(!final && thread->sync_report_tsc && now-thread->sync_report_tsc<(1ull<<34)) return;
+    thread->sync_report_tsc=now;
+    for(op=0;op<PW_WOW_SYNC_OPERATIONS;op++)
+        fprintf(stderr,"wowprospero sync_bop: tid=%04x cumulative=1 final=%u op=%u attempts=%llu hits=%llu preflight_misses=%llu backend_misses=%llu output_statuses=%llu lease_misses=%llu resets=%llu\n",
+                PtrToUlong(NtCurrentTeb()->ClientId.UniqueThread),final,op,
+                (unsigned long long)thread->sync_attempts[op],(unsigned long long)thread->sync_hits[op],
+                (unsigned long long)thread->sync_preflight_misses[op],(unsigned long long)thread->sync_backend_misses[op],
+                (unsigned long long)thread->sync_output_statuses[op],(unsigned long long)thread->sync_lease_misses[op],
+                (unsigned long long)thread->sync_resets);
+    for(i=0;i<16;i++) if(thread->sync_wait[i].used)
+        fprintf(stderr,"wowprospero sync_bop_wait: tid=%04x cumulative=1 final=%u handle=%x calls=%llu hits=%llu misses=%llu alertable=%llu infinite=%llu overflow=%llu\n",
+                PtrToUlong(NtCurrentTeb()->ClientId.UniqueThread),final,thread->sync_wait[i].handle,
+                (unsigned long long)thread->sync_wait[i].calls,(unsigned long long)thread->sync_wait[i].hits,
+                (unsigned long long)thread->sync_wait[i].misses,(unsigned long long)thread->sync_wait[i].alertable,
+                (unsigned long long)thread->sync_wait[i].infinite,(unsigned long long)thread->sync_wait_overflow);
+}
+static int sync_detach( struct pw_thread *thread )
+{
+    unsigned attempt;
+    uint32_t done;
+    if (!thread->sync_attached) return 1;
+    if (thread->sync_memory.state != PW_BOP_MEMORY_EMPTY && !sync_loaded_end(&thread->sync_memory)) return 0;
+    if (thread->sync_published)
+    {
+        done=sync_context->finish(&thread->sync_context,PW_BOP_CONTEXT_FAULT);
+        if (done==PW_BOP_CONTEXT_INVALID) return 0;
+        thread->sync_published=0;
+    }
+    /* Teardown checkpoints only the native complete image, not guest code. */
+    for (attempt=0;attempt<8;attempt++)
+    {
+        done=sync_pending->checkpoint(&thread->sync_pending,thread->sync_canonical,sizeof(I386_CONTEXT));
+        if (done!=PW_BOP_PENDING_INVALID) break;
+        if (!thread->sync_pending.guard) return 0;
+    }
+    if (done==PW_BOP_PENDING_INVALID || !sync_memory_begin(thread)) return 0;
+    done=sync_pending->detach(&thread->sync_pending);
+    if (!sync_loaded_end(&thread->sync_memory)) return 0;
+    if (done) thread->sync_attached=0;
+    return done;
+}
+#endif
+
 static NTSTATUS run( void *args )
 {
     struct pw_wow_run_params *params = args;
@@ -1208,11 +1582,40 @@ static NTSTATUS run( void *args )
         reset_thread_engine( thread );
         pw_x86_hostexec_reset( &thread->hostexec );
     }
+#ifdef __PROSPERO__
+    if (sync_attach(thread,ctx,params)<0) goto sync_stop;
+#endif
     load_state( state, ctx, params->teb32 );
     sync_fp_in( thread, ctx );
     for (;;)
     {
-        if (state->eip == params->bop) { params->reason = PW_WOW_SYSCALL; break; }
+#ifdef __PROSPERO__
+        if (thread->sync_attached)
+        {
+            if (sync_checkpoint(thread,ctx,params->teb32,0)<0) goto sync_stop;
+            /* A completed fast call stays in Unix. Check notifications which
+             * the ordinary PE return would otherwise recheck on reentry. */
+            generation=__atomic_load_n(&code_generation,__ATOMIC_ACQUIRE);
+            if (thread->generation!=generation)
+            {
+                pw_x86_engine_fp_sync(&thread->engine,state);
+                thread->generation=generation;thread->n_flushes++;
+                reset_thread_engine(thread);pw_x86_hostexec_reset(&thread->hostexec);
+            }
+        }
+#endif
+        if (state->eip == params->bop)
+        {
+#ifdef __PROSPERO__
+            if (thread->sync_attached)
+            {
+                int consumed=sync_try(thread,ctx,params);
+                if (consumed<0) goto sync_stop;
+                if (consumed) continue;
+            }
+#endif
+            params->reason = PW_WOW_SYSCALL; break;
+        }
         if (state->eip == params->unix_bop) { params->reason = PW_WOW_UNIXCALL; break; }
         if (thread->trace) thread->ring[thread->ring_pos++ & 63] = state->eip;
         if (thread->prefer_host)
@@ -1255,8 +1658,25 @@ static NTSTATUS run( void *args )
         break;
     }
     pw_x86_commit_canonical_flags( state );
-    store_state( state, ctx );
-    sync_fp_out( thread, ctx );
+#ifdef __PROSPERO__
+    if (thread->sync_attached)
+    {
+        if (sync_leave(thread,ctx,params)<0) goto sync_stop;
+    }
+    else
+#endif
+    {
+        store_state( state, ctx );
+        sync_fp_out( thread, ctx );
+    }
+#ifdef __PROSPERO__
+    goto sync_done;
+sync_stop:
+    params->reason=PW_WOW_STOP;
+    params->status=STATUS_INTERNAL_ERROR;
+sync_done:
+    sync_report(thread,0);
+#endif
     if (timing_enabled) timing_leave( thread, params->reason );
     profile_maybe_dump();
     return STATUS_SUCCESS;
@@ -1308,6 +1728,10 @@ static NTSTATUS thread_term( void *args )
     struct pw_thread *thread = self;
 
     if (!thread) return STATUS_SUCCESS;
+#ifdef __PROSPERO__
+    sync_report(thread,1);
+    if (!sync_detach(thread)) return STATUS_INTERNAL_ERROR;
+#endif
     execution_report( thread );
     if (timing_enabled > 0) cache_report( thread, timing_now_ns(), 1 );
     self = NULL;

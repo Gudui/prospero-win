@@ -695,3 +695,44 @@ patches before compiling their actual helper bodies. Explicit OS and FP
 mocks cover commit with no VM lease, pending field/FP merges, block refusal,
 retained restore recovery, queued edits on restore and invalid contexts.
 No runtime consumer is activated by this provider dependency.
+
+### Parked BOP consumer candidate (5 October 2026)
+
+The dependent `codex/shared-sync-bop-consumer` branch wires the native BOP
+interfaces into the Unix run loop and PE CPU return path. It requires all
+four native interfaces, including the version 2 pending checkpoint, and a
+matching version 2 PE/Unix contract. The run contract adds `sync_active` at
+offset 48; its native size is 56 bytes. Version 1 initialization declines
+interception. The mode remains OFF unless explicitly selected.
+
+Each recognized call rechecks its loaded 32-bit stub, helper, dispatcher and
+stack continuation under a fresh guest-memory lease. A warm hit commits the
+ordinary continuation and complete guest FP/register image, then continues
+inside Unix. Misses return through the ordinary syscall path. Output failure
+after a completed scalar operation returns its NTSTATUS without repeating
+that operation. Pending observer edits take precedence over stale engine
+state, and CPU return guards prevent a replaced exit from dispatching an
+ordinary service or restoring stale FP. Provider refusal stops execution;
+thread storage is retained if native observer cleanup cannot finish.
+
+Optional cumulative diagnostics use the strict selector
+`PW_WOW_SYNC_BOP_DIAGNOSTICS=1`, or the console file
+`/data/prospero-win/pw_wow_sync_bop_diagnostics` containing exactly `1` or
+`1` followed by one newline. They report per-operation attempts, warm hits,
+preflight/backend/lease misses, output statuses and resets, plus a bounded
+wait-handle summary. These are diagnostic counts, not a measured speed gain.
+
+The extended `tests/test_wow_sync_bop_loaded.py` executes the actual run-loop,
+CPU return and native context/pending bodies against explicit bounded
+engine, service, memory, FP-conversion and OS mocks. Normal and ASan/UBSan
+runs passed. Complete ten-unit translator and PE CPU builds also passed;
+the nine unchanged DBT objects were identical between arms. These checks
+do not execute Wine or establish console asynchronous behavior, performance,
+load time or stability.
+
+Work was stopped at the owner's request. This candidate is preserved for
+review, with no console deployment, PR or merge. Remaining work includes
+expanded asynchronous/cleanup review, latest-main integration, and real
+console semantic and performance gates. The validated console defaults are
+unchanged. The recorded city average is about 54–55 FPS; the former 58/50
+performance target was not demonstrated before closing this workstream.

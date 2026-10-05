@@ -435,6 +435,7 @@ void WINAPI BTCpuSimulate(void)
         params.bop = PtrToUlong( bop_page );
         params.unix_bop = PtrToUlong( bop_page + 16 );
         params.reason = 0;
+        params.sync_active = 0;
         params.cpu_flags = (ULONG_PTR)&cpu->Flags;
         /* The guest's x87 and SSE state is this thread's hardware state
          * while the guest is out for a system call, as with wow64cpu: Wine
@@ -452,6 +453,20 @@ void WINAPI BTCpuSimulate(void)
             copy_fxsave( ctx->ExtendedRegisters, &fp );
         }
         status = WINE_UNIX_CALL( pw_wow_run, &params );
+        if (!status && params.reason == PW_WOW_STOP)
+        {
+            /* Do not restore stale FP, dereference a guest stack, raise a
+             * guest fault or retry a service after a provider refusal. */
+            NtTerminateProcess( 0, STATUS_INTERNAL_ERROR );
+            NtTerminateProcess( GetCurrentProcess(), STATUS_INTERNAL_ERROR );
+            return;
+        }
+        if (!status && params.sync_active &&
+            (params.reason == PW_WOW_RESET || (cpu->Flags & WOW64_CPURESERVED_FLAG_RESET_STATE)))
+        {
+            cpu->Flags |= PW_FP_IN_CONTEXT;
+            continue;
+        }
         if (!status && params.reason == PW_WOW_UNIXCALL)
             cpu->Flags |= PW_FP_IN_CONTEXT;
         else
@@ -467,6 +482,11 @@ void WINAPI BTCpuSimulate(void)
             ERR( "host exception %#lx in translated code near eip %#lx\n", status, ctx->Eip );
             WINE_UNIX_CALL( pw_wow_dump, NULL );
             raise_guest_exception( ctx, status, 0, 0 );
+            continue;
+        }
+        if (params.sync_active && (cpu->Flags & WOW64_CPURESERVED_FLAG_RESET_STATE))
+        {
+            cpu->Flags |= PW_FP_IN_CONTEXT;
             continue;
         }
         stack = ULongToPtr( ctx->Esp );

@@ -13,9 +13,11 @@ enum pw_wow_reason
     PW_WOW_UNSUPPORTED = 4, /* DBT cannot translate the instruction at EIP */
     PW_WOW_X87_TRAP = 5,
     PW_WOW_ERROR = 6,
+    PW_WOW_RESET = 7,       /* complete observer context replaced the exit */
+    PW_WOW_STOP = 8,        /* persistent native cleanup refusal */
 };
 
-#define PW_WOW_INIT_VERSION 1u
+#define PW_WOW_INIT_VERSION 2u
 /* Callbacks are used only during initialization, in the PE x86-64 ABI. */
 typedef UINT (WINAPI *pw_wow_image_read_t)( UINT64, void *, UINT );
 typedef UINT64 (WINAPI *pw_wow_export_t)( UINT64, const char * );
@@ -39,6 +41,7 @@ struct pw_wow_run_params
     UINT   fault_address;   /* out */
     UINT   fault_write;     /* out */
     UINT64 cpu_flags;       /* WOW64_CPURESERVED.Flags *, native address */
+    UINT   sync_active;     /* out, only after version 2 negotiation */
 };
 
 struct pw_wow_flush_params
