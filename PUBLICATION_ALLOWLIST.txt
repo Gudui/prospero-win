@@ -367,3 +367,8 @@ wine/patches/0888-ntdll-ps5-shared-sync-default-on.patch
 wine/patches/0890-ntdll-ps5-warm-sync-native-api.patch
 tests/test_wine_sync_bop_backend.py
 tests/fixtures/wine_sync_bop_backend.c
+
+# Scalar BOP transaction dependency; no runtime activation.
+wine/wowprospero/sync_bop_adapter.h
+tests/test_wow_sync_bop_adapter.py
+tests/fixtures/wow_sync_bop_adapter.c

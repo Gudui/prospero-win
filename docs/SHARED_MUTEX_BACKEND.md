@@ -476,3 +476,39 @@ server control retains the previously documented assertion-line metadata
 mapping; no candidate header is rewritten. The ordinary Wine matrix and
 combined default-on acceptance are recorded above. They do not validate
 later source revisions or establish the broader asynchronous contracts.
+
+### BOP transaction core and remaining integration
+
+`wine/wowprospero/sync_bop_adapter.h` implements the scalar transaction for
+all five native sync operations. It requires an attested, unique NTDLL
+service map, captures the stub return and arguments before any output write,
+and preflights stack, optional timeout and output spans before publication
+or CAS. Nonalertable waits follow Wow64's eight-bit `BOOLEAN` conversion.
+A hit pops exactly the stub call return, changes EAX to `STATUS_SUCCESS`
+and leaves other registers and flags unchanged. Output aliases to arguments
+or either return slot follow the ordinary captured-argument order.
+
+A miss leaves guest registers, object state and output storage unchanged.
+The context callbacks must restore their prior view on a miss. A write
+refused after a successful CAS is a committed operation plus an output
+fault, never a retryable miss. If Wine replaced the context, its canonical
+registers and FP image take precedence over the ordinary success return.
+
+`python3 tests/test_wow_sync_bop_adapter.py` compares the core against an
+independent ordinary CPU/Wow64 marshalling reference. The bounded native
+fixture checks all five operations, output aliases, misses, timeout/output
+preflight, mocked write refusal after CAS, and replacement-context/FP
+publication callbacks. Normal and sanitizer checks execute no Wine, guest
+program, kernel fault or console operation. Callback mocks do not establish
+Wine's asynchronous context behavior or performance.
+
+This is a dependency, not an active BOP interceptor. Remaining integration
+must validate loaded PE32 NTDLL identities against matching native and WoW64
+metadata; retain the native module; provide protected guest memory access;
+and publish the complete guest FP state in Wine's native syscall frame.
+Publishing `I386_CONTEXT` alone is insufficient: pinned Wine's
+`get_thread_wow64_context` reads extended registers from `frame->xsave`.
+Context reset, callbacks, native-frame restoration, diagnostics accounting
+and ordinary fallback must remain correct before the run loop consumes the
+transaction core. No activation or FPS gain is claimed by this dependency.
+The full city58/50, load, HL2/clean Wine-exit and stability goal remains open.
