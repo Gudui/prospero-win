@@ -27,6 +27,7 @@
 #include "rtlsupportapi.h"
 #include "wine/unixlib.h"
 #include "wine/debug.h"
+#include "wine/exception.h"
 #include "wowprospero.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(wow);
@@ -63,8 +64,66 @@ static UINT get_teb32(void)
     return PtrToUlong( (BYTE *)NtCurrentTeb() + NtCurrentTeb()->WowTebOffset );
 }
 
+static UINT WINAPI read_sync_image64( UINT64 address, void *out, UINT bytes )
+{
+    SIZE_T read = 0;
+
+    if (!bytes || bytes > 32) return 0;
+    return !NtReadVirtualMemory( GetCurrentProcess(), (const void *)(ULONG_PTR)address,
+                                 out, bytes, &read ) && read == bytes;
+}
+
+static UINT64 WINAPI resolve_sync_export32( UINT64 module, const char *name )
+{
+    volatile UINT64 address = 0;
+
+    /* The Unix initializer holds its VM lease over the actual loaded Wine
+     * image. This callback resolves data; it never executes 32-bit code. */
+    __TRY
+    {
+        address = (ULONG_PTR)RtlFindExportedRoutineByName( (HMODULE)(ULONG_PTR)module, name );
+    }
+    __EXCEPT_PAGE_FAULT
+    {
+        address = 0;
+    }
+    __ENDTRY
+    return address;
+}
+
+static void prepare_sync_init( HMODULE module, struct pw_wow_init_params *params )
+{
+    static const char *const names[] =
+    {
+        "NtWaitForSingleObject", "NtReleaseMutant", "NtSetEvent",
+        "NtResetEvent", "NtReleaseSemaphore"
+    };
+    SYSTEM_DLL_INIT_BLOCK *block;
+    IMAGE_NT_HEADERS *nt;
+    unsigned int i;
+
+    memset( params, 0, sizeof(*params) );
+    params->version = PW_WOW_INIT_VERSION;
+    params->size = sizeof(*params);
+    if (LdrAddRefDll( LDR_ADDREF_DLL_PIN, module )) return;
+    nt = RtlImageNtHeader( module );
+    block = RtlFindExportedRoutineByName( module, "LdrSystemDllInitBlock" );
+    if (!nt || nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64 ||
+        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC || !block ||
+        block->version < FIELD_OFFSET(SYSTEM_DLL_INIT_BLOCK, ntdll_handle) + sizeof(block->ntdll_handle)) return;
+    params->module64 = (ULONG_PTR)module;
+    params->module64_size = nt->OptionalHeader.SizeOfImage;
+    params->module32 = block->ntdll_handle;
+    for (i = 0; i < ARRAY_SIZE(names); i++)
+        params->exports64[i] = (ULONG_PTR)RtlFindExportedRoutineByName( module, names[i] );
+    params->read64 = (ULONG_PTR)read_sync_image64;
+    params->resolve32 = (ULONG_PTR)resolve_sync_export32;
+    params->retained64 = 1;
+}
+
 NTSTATUS WINAPI BTCpuProcessInit(void)
 {
+    struct pw_wow_init_params params;
     HMODULE module;
     UNICODE_STRING str = RTL_CONSTANT_STRING( L"ntdll.dll" );
     void **dispatcher;
@@ -87,7 +146,15 @@ NTSTATUS WINAPI BTCpuProcessInit(void)
     bop_page[16] = 0xcc; /* Unix-call BOP */
     NtProtectVirtualMemory( GetCurrentProcess(), &page, &size, PAGE_EXECUTE_READ, &old_prot );
 
-    status = WINE_UNIX_CALL( pw_wow_process_init, NULL );
+    prepare_sync_init( module, &params );
+    status = WINE_UNIX_CALL( pw_wow_process_init, &params );
+    if (status)
+    {
+        /* Wow64's caller declares ProcessInit void. An unrecoverable native
+         * initialization failure must stop before guest execution starts. */
+        NtTerminateProcess( 0, status );
+        NtTerminateProcess( GetCurrentProcess(), status );
+    }
     TRACE( "bop %p status %#lx\n", bop_page, status );
     return status;
 }
@@ -368,6 +435,7 @@ void WINAPI BTCpuSimulate(void)
         params.bop = PtrToUlong( bop_page );
         params.unix_bop = PtrToUlong( bop_page + 16 );
         params.reason = 0;
+        params.cpu_flags = (ULONG_PTR)&cpu->Flags;
         /* The guest's x87 and SSE state is this thread's hardware state
          * while the guest is out for a system call, as with wow64cpu: Wine
          * keeps a wow64 thread's 32-bit FP context there (frame->xsave), so

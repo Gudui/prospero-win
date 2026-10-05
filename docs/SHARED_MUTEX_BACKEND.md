@@ -601,3 +601,37 @@ SDK compilation and ordinary console gates.
 There is no runtime consumer or activation in this dependency. CPU-loaded
 identity/lifetime, run-loop FP/reset/diagnostic handling and complete console
 semantic, performance, load and stability gates remain pending.
+
+### CPU-loaded binding transport
+
+The PE CPU initializer now supplies a versioned 96-byte initialization
+contract to its Unix library. It pins the actual 64-bit NTDLL through
+`LdrAddRefDll`, obtains its five named exports, and reads the actual 32-bit handle
+from `LdrSystemDllInitBlock`. The run contract carries the native CPU flag
+address for later reset handling; both modules must be built together.
+
+The Unix initializer requests the three native BOP interfaces and validates
+their versions, sizes, pointer sizes and complete operation support. Its
+memory lease protects the actual 32-bit read window while it checks the image
+header, resolves named exports and attests all five paired service stubs.
+64-bit reads use the CPU's guarded read callback. No 32-bit code is executed.
+Only the copied attestation remains after initialization. A later consumer
+must revalidate its 32-bit stub, helper and dispatcher under a fresh memory lease
+at each BOP; this transport does not assume a permanent native-loader pin
+for the 32-bit image.
+
+The mode defaults OFF. An existing `PW_WOW_SYNC_BOP` environment value wins,
+with exact `1` enabling it. Otherwise the console file
+`/data/prospero-win/pw_wow_sync_bop` must contain exactly `1` or `1` plus one
+newline. An unavailable identity/API remains ordinary. Cleanup retries are
+bounded; unrecovered native storage remains valid and initialization returns
+an internal error. The PE initializer stops the process before guest
+execution on that error, because Wow64 declares its ProcessInit callback void.
+
+`python3 tests/test_wow_sync_bop_loaded.py` compiles the actual CPU and Unix
+binding bodies with explicit image, loader, memory and OS mocks. It checks
+the shared ABI, strict selectors, full service matching, incomplete and
+malformed images, guarded-read refusal and bounded recovery. These tests do
+not execute Wine, guest code, stubs, real signals or faults. The run-loop
+consumer, consistent module builds and complete console gates remain
+required. This transport performs no interception and claims no speed gain.

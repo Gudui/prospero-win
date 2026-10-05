@@ -15,6 +15,19 @@ enum pw_wow_reason
     PW_WOW_ERROR = 6,
 };
 
+#define PW_WOW_INIT_VERSION 1u
+/* Callbacks are used only during initialization, in the PE x86-64 ABI. */
+typedef UINT (WINAPI *pw_wow_image_read_t)( UINT64, void *, UINT );
+typedef UINT64 (WINAPI *pw_wow_export_t)( UINT64, const char * );
+struct pw_wow_init_params
+{
+    UINT version, size;
+    UINT64 module32, module64, module64_size;
+    UINT64 exports64[5];
+    UINT64 read64, resolve32;
+    UINT retained64, reserved;
+};
+
 struct pw_wow_run_params
 {
     UINT64 context;         /* I386_CONTEXT *, 64-bit address */
@@ -25,6 +38,7 @@ struct pw_wow_run_params
     INT    status;          /* out: DBT status for FAULT/UNSUPPORTED/ERROR */
     UINT   fault_address;   /* out */
     UINT   fault_write;     /* out */
+    UINT64 cpu_flags;       /* WOW64_CPURESERVED.Flags *, native address */
 };
 
 struct pw_wow_flush_params

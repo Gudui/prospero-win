@@ -864,6 +864,151 @@ static void register_arena( struct pw_thread *thread, int add )
     }
 }
 
+#ifdef __PROSPERO__
+#include "wine/ps5_sync_bop.h"
+#include "wine/ps5_sync_bop_context.h"
+#include "wine/ps5_sync_bop_memory.h"
+#include "sync_bop_bindings.h"
+
+extern const struct pw_sync_bop_backend *__wine_ps5_sync_bop_backend(uint32_t);
+extern const struct pw_sync_bop_context_backend *__wine_ps5_sync_bop_context_backend(uint32_t);
+extern const struct pw_sync_bop_memory_backend *__wine_ps5_sync_bop_memory_backend(uint32_t);
+
+static const struct pw_sync_bop_backend *sync_backend;
+static const struct pw_sync_bop_context_backend *sync_context;
+static const struct pw_sync_bop_memory_backend *sync_memory;
+static struct pw_wow_sync_attestation sync_attestation;
+/* Persistent storage also survives a mocked OS cleanup refusal. */
+static struct pw_sync_bop_memory_view sync_init_memory;
+static int sync_bound;
+
+static int sync_requested(void)
+{
+    const char *value = getenv( "PW_WOW_SYNC_BOP" );
+    char bytes[3];
+    FILE *file;
+    size_t count;
+
+    if (value) return !strcmp( value, "1" );
+    if (!(file = fopen( "/data/prospero-win/pw_wow_sync_bop", "rb" ))) return 0;
+    count = fread( bytes, 1, sizeof(bytes), file );
+    if (ferror(file)) count = 0;
+    fclose( file );
+    return (count == 1 && bytes[0] == '1') ||
+           (count == 2 && bytes[0] == '1' && bytes[1] == '\n');
+}
+
+static int sync_loaded_read32( void *opaque, uint64_t address, void *out, size_t bytes )
+{
+    if (address > UINT32_MAX || bytes > PW_BOP_MEMORY_MAX_BYTES) return 0;
+    return sync_memory->read( opaque, (uint32_t)address, out, (uint32_t)bytes );
+}
+
+static int sync_loaded_read64( void *opaque, uint64_t address, void *out, size_t bytes )
+{
+    const struct pw_wow_init_params *params = opaque;
+    pw_wow_image_read_t read = (pw_wow_image_read_t)(ULONG_PTR)params->read64;
+
+    if (!read || bytes > 32) return 0;
+    return read( address, out, (UINT)bytes );
+}
+
+static int sync_loaded_image32( struct pw_sync_bop_memory_view *view,
+                                uint64_t base, struct pw_wow_sync_image *image )
+{
+    uint8_t dos[2], header[24], magic[2], size_bytes[4];
+    uint32_t offset, bytes;
+    uint64_t optional;
+
+    if (base < GUEST_LOW || base > GUEST_HIGH - 64 ||
+        !sync_loaded_read32(view,base,dos,2) || dos[0] != 'M' || dos[1] != 'Z' ||
+        !sync_loaded_read32(view,base + 60,size_bytes,4)) return 0;
+    offset = pw_wow_sync_read_le32( size_bytes );
+    if (offset < 64 || offset > 0x100000 || base + offset > GUEST_HIGH - 88 ||
+        !sync_loaded_read32(view,base + offset,header,sizeof(header)) ||
+        memcmp(header,"PE\0\0",4) || header[4] != 0x4c || header[5] != 1 ||
+        ((unsigned)header[20] | (unsigned)header[21] << 8) < 96) return 0;
+    optional = base + offset + sizeof(header);
+    if (!sync_loaded_read32(view,optional,magic,2) || magic[0] != 0x0b || magic[1] != 1 ||
+        !sync_loaded_read32(view,optional + 56,size_bytes,4)) return 0;
+    bytes = pw_wow_sync_read_le32( size_bytes );
+    if (bytes < offset + 24 + 96 || bytes > GUEST_HIGH - base) return 0;
+    *image = (struct pw_wow_sync_image){base,bytes,view,sync_loaded_read32};
+    return 1;
+}
+
+static int sync_loaded_end( struct pw_sync_bop_memory_view *view )
+{
+    unsigned attempt;
+
+    for (attempt = 0; attempt < 8; attempt++) if (sync_memory->end(view)) return 1;
+    return 0;
+}
+
+static NTSTATUS sync_loaded_init( const struct pw_wow_init_params *params )
+{
+    struct pw_wow_sync_identity_source source = {0};
+    struct pw_wow_sync_attestation candidate;
+    pw_wow_export_t resolve;
+    uint32_t begun;
+    unsigned i;
+    int accepted = 0;
+
+    sync_bound = 0;
+    if (!sync_requested()) return STATUS_SUCCESS;
+    if (!params || params->version != PW_WOW_INIT_VERSION || params->size != sizeof(*params) ||
+        !params->retained64 || !params->module64 || !params->module64_size ||
+        !params->read64 || !params->resolve32) goto disabled;
+    sync_backend = __wine_ps5_sync_bop_backend( PW_SYNC_BOP_VERSION );
+    sync_context = __wine_ps5_sync_bop_context_backend( PW_BOP_CONTEXT_VERSION );
+    sync_memory = __wine_ps5_sync_bop_memory_backend( PW_BOP_MEMORY_VERSION );
+    if (!pw_sync_bop_backend_valid(sync_backend) || !sync_context || !sync_memory ||
+        sync_context->version != PW_BOP_CONTEXT_VERSION || sync_context->size != sizeof(*sync_context) ||
+        sync_context->pointer_size != sizeof(void *) || sync_context->context_size != sizeof(I386_CONTEXT) ||
+        !sync_context->publish || !sync_context->finish ||
+        sync_memory->version != PW_BOP_MEMORY_VERSION || sync_memory->size != sizeof(*sync_memory) ||
+        sync_memory->pointer_size != sizeof(void *) || sync_memory->view_size != sizeof(sync_init_memory) ||
+        !sync_memory->begin || !sync_memory->end || !sync_memory->read ||
+        !sync_memory->writable || !sync_memory->write) goto disabled;
+    sync_init_memory.version = PW_BOP_MEMORY_VERSION;
+    sync_init_memory.size = sizeof(sync_init_memory);
+    begun = sync_memory->begin( &sync_init_memory );
+    if (begun == PW_BOP_MEMORY_EMPTY) goto disabled;
+    if (begun != PW_BOP_MEMORY_HELD)
+    {
+        if (!sync_loaded_end(&sync_init_memory)) return STATUS_INTERNAL_ERROR;
+        goto disabled;
+    }
+    source.version = PW_WOW_SYNC_IMAGE_VERSION;
+    /* Native64 is pinned; the VM lease retains the actual32 read window.
+     * Future calls must revalidate their32 stub/helper/dispatcher under a
+     * fresh lease. There is no permanent32 native-loader pin assumption. */
+    source.retained = 1;
+    source.pe64 = (struct pw_wow_sync_image){params->module64,params->module64_size,
+                                           (void *)params,sync_loaded_read64};
+    resolve = (pw_wow_export_t)(ULONG_PTR)params->resolve32;
+    if (sync_loaded_image32(&sync_init_memory,params->module32,&source.pe32))
+    {
+        for (i = 0; i < PW_WOW_SYNC_OPERATIONS; i++)
+        {
+            source.exports32[i] = resolve( params->module32, pw_wow_sync_export_name(i) );
+            source.exports64[i] = params->exports64[i];
+        }
+        source.dispatcher32 = resolve( params->module32, "__wine_syscall_dispatcher" );
+        accepted = pw_wow_sync_attest( &source, &candidate );
+    }
+    if (!sync_loaded_end(&sync_init_memory)) return STATUS_INTERNAL_ERROR;
+    if (!accepted) goto disabled;
+    sync_attestation = candidate;
+    sync_bound = 1;
+    fprintf( stderr, "wowprospero sync BOP: loaded identities bound (consumer inactive)\n" );
+    return STATUS_SUCCESS;
+disabled:
+    fprintf( stderr, "wowprospero sync BOP: ordinary fallback (binding unavailable)\n" );
+    return STATUS_SUCCESS;
+}
+#endif
+
 static NTSTATUS process_init( void *args )
 {
     long page = sysconf( _SC_PAGESIZE );
@@ -900,7 +1045,11 @@ static NTSTATUS process_init( void *args )
         }
     }
     profile_start();
+#ifdef __PROSPERO__
+    return sync_loaded_init( args );
+#else
     return STATUS_SUCCESS;
+#endif
 }
 
 /* PW_WOW_TIMING=1 (in a title, which passes Wine no such variable: the
