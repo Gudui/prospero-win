@@ -380,5 +380,7 @@ tests/test_wine_sync_bop_context.py
 wine/patches/0892-ntdll-ps5-sync-bop-memory-lease.patch
 wine/patches/0893-ntdll-ps5-sync-bop-pending-edits.patch
 tests/test_wine_sync_bop_pending.py
+tests/test_wine_sync_bop_checkpoint.py
+wine/patches/0894-ntdll-ps5-sync-bop-native-checkpoint.patch
 tests/test_wine_sync_bop_memory.py
 tests/test_wow_sync_bop_loaded.py

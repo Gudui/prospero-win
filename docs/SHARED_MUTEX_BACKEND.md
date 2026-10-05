@@ -672,3 +672,26 @@ native host FP frame, retained edits across return boundaries, lease/reset
 guards and nested-record refusal. Real Wine, signals, faults, guest execution
 and console speed are outside these fixture checks. Complete SDK modules and
 the actual CPU/run-loop consumer remain necessary for console validation.
+
+### Native checkpoint without the VM mutex
+
+Patch 0894 extends the pending observer to version 2. Its checkpoint handles
+only the native canonical context and a supplied complete guest snapshot;
+it performs no guest-memory access and does not acquire the VM mutex. This
+keeps ordinary context handoff independent of guest mapping contention.
+The consumer may use transaction publication for a normal exit and this
+checkpoint when a pending reset or incomplete native frame prevents it.
+
+The checkpoint blocks Wine's existing server signal set while it merges
+explicit observer edits and commits the complete image. Even with no edits,
+it commits the current snapshot. A refused mask restore retains its saved
+mask and result in the persistent view. Recovery retries restore only;
+they never reapply an old snapshot or repeat an object operation. Detach
+refuses a retained guard. Invalid or unsupported context remains retained
+for ordinary recovery or a stop; no stale guest continuation is permitted.
+
+`python3 tests/test_wine_sync_bop_checkpoint.py` replays the real provider
+patches before compiling their actual helper bodies. Explicit OS and FP
+mocks cover commit with no VM lease, pending field/FP merges, block refusal,
+retained restore recovery, queued edits on restore and invalid contexts.
+No runtime consumer is activated by this provider dependency.
