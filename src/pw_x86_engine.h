@@ -35,6 +35,7 @@ enum { PW_X86_HOTSPOT_SLOTS = 4096 };
 typedef struct PwX86Hotspot {
     uint32_t guest_pc;
     uint64_t samples, entry, body, exit, emitted;
+    uint64_t verify;  /* of body: in the source check before the first instruction */
 } PwX86Hotspot;
 typedef struct PwX86HotspotProfile {
     PwX86Hotspot slots[PW_X86_HOTSPOT_SLOTS];
@@ -106,6 +107,9 @@ typedef struct PwX86Engine {
     unsigned superblocks;       /* PwX86TranslateOptions.superblocks */
     unsigned native_fp;         /* PwX86TranslateOptions.native_fp */
     unsigned call_predict;      /* PwX86TranslateOptions.call_predict */
+    unsigned jump_tables;       /* PwX86TranslateOptions.jump_tables */
+    unsigned jump_predict;      /* PwX86TranslateOptions.jump_predict */
+    uint64_t jump_table_blocks; /* blocks translated with a jump table */
     uint8_t fxsave_image[512 + 15];  /* the guest's FP state while a block runs */
     /* The image above, not PwX86State.fp, holds the guest's x87/SSE state
      * (pw_x86_engine_fp_sync). */
@@ -176,6 +180,12 @@ int pw_x86_engine_set_native_fp(PwX86Engine *, unsigned enabled);
 /* PwX86TranslateOptions.call_predict for blocks translated from now on: the
  * caller's code memory must stay writable while it runs. */
 int pw_x86_engine_set_call_predict(PwX86Engine *, unsigned enabled);
+/* PwX86TranslateOptions.jump_tables and jump_predict for blocks translated
+ * from now on, with superblocks' writable code. A table's bytes are read
+ * through the source view, as source is, and trusted only where source
+ * would be. */
+int pw_x86_engine_set_jump_tables(PwX86Engine *, unsigned enabled);
+int pw_x86_engine_set_jump_predict(PwX86Engine *, unsigned enabled);
 /* With native_fp, re-encoded blocks run on the guest's x87/SSE state as an
  * FXSAVE image in the host FPU. Converting it to and from PwX86State.fp
  * around every step cost an OpenGL game a fifth of its time, so the image

@@ -373,6 +373,20 @@ int pw_x86_engine_set_superblocks(PwX86Engine *engine, unsigned enabled)
     return PW_OK;
 }
 
+int pw_x86_engine_set_jump_tables(PwX86Engine *engine, unsigned enabled)
+{
+    if(!engine || !engine->initialized) return PW_ERR_PRECONDITION;
+    engine->jump_tables = enabled ? 1 : 0;
+    return PW_OK;
+}
+
+int pw_x86_engine_set_jump_predict(PwX86Engine *engine, unsigned enabled)
+{
+    if(!engine || !engine->initialized) return PW_ERR_PRECONDITION;
+    engine->jump_predict = enabled ? 1 : 0;
+    return PW_OK;
+}
+
 int pw_x86_engine_set_call_predict(PwX86Engine *engine, unsigned enabled)
 {
     if(!engine || !engine->initialized) return PW_ERR_PRECONDITION;
@@ -435,7 +449,10 @@ void pw_x86_engine_sample(const PwX86Engine *engine, uintptr_t rip, PwX86Hotspot
             row->samples++;
             if(!pw_x86_reencoded(&entry->entry_contract) || !entry->exit_offset) row->emitted++;
             else if(offset < entry->chain_entry_offset) row->entry++;
-            else if(offset < entry->exit_offset) row->body++;
+            else if(offset < entry->exit_offset) {
+                row->body++;
+                if(offset < entry->body_offset) row->verify++;
+            }
             else row->exit++;
             return;
         }
@@ -493,6 +510,22 @@ int pw_x86_engine_set_indirect(PwX86Engine *engine, unsigned enabled)
     return PW_OK;
 }
 
+/* PwX86TranslateOptions.read_trusted: the bytes through the source view,
+ * when it trusts all of them as it would trust source. */
+static int read_trusted(void *opaque, uint32_t address, size_t bytes, const uint8_t **data)
+{
+    PwX86Engine *engine = opaque;
+    const uint8_t *source = NULL;
+    size_t available = 0, writable_from = SIZE_MAX;
+    int status = engine->source_view_writable
+        ? engine->source_view_writable(engine->source_opaque, address, &source, &available, &writable_from)
+        : engine->source_view(engine->source_opaque, address, &source, &available);
+
+    if(status != PW_OK || !source || available < bytes || writable_from < bytes) return 0;
+    *data = source;
+    return 1;
+}
+
 static int compile(PwX86Engine *engine,uint32_t pc,const PwX86CacheEntry **entry)
 {
     const uint8_t *source=NULL;size_t available=0,writable_from=SIZE_MAX;
@@ -513,11 +546,15 @@ static int compile(PwX86Engine *engine,uint32_t pc,const PwX86CacheEntry **entry
         engine->residency_enabled ? engine->global_resident : (uint8_t)0,
         engine->fault_markers, engine->unbounded_chains, engine->call_stack_base != NULL,
         engine->superblocks, engine->native_fp, engine->call_predict,
-        writable_from < available, writable_from };
+        writable_from < available, writable_from,
+        read_trusted, engine, engine->jump_tables, engine->jump_predict };
     int last = PW_ERR_UNSUPPORTED;
     if (engine->reencode_enabled) {
         last = pw_x86_reencode(source, available, pc, scratch, sizeof(scratch), &best, &options);
-        if (last == PW_OK) engine->reencoded_blocks++;
+        if (last == PW_OK) {
+            engine->reencoded_blocks++;
+            if (best.table_entries) engine->jump_table_blocks++;
+        }
     }
     if (last != PW_OK)
         last = pw_x86_translate_opts(source, available, pc, scratch, sizeof(scratch), &best, &options);
