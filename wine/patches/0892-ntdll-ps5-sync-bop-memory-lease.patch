@@ -1,0 +1,214 @@
+From: Prospero Win contributors <prospero-win@localhost>
+Subject: [PATCH] ntdll: prepare bounded native sync-BOP memory lease
+
+Use the existing Wine VM lock and signal set to keep tiny argument/output
+spans authoritative across a warm sync transaction. All-page checks do not
+write probes or consume guard/writewatch state. Unavailable spans fall back.
+No run-loop consumer or activation is included.
+
+diff --git a/dlls/ntdll/unix/unix_private.h b/dlls/ntdll/unix/unix_private.h
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -120,16 +120,17 @@
+     unsigned int ps5_sleeps;
+ #if defined(__PROSPERO__) || defined(WINE_INPROCESS_SERVER)
+     unsigned int ps5_mutex_token; /* occupies the padding before ps5_sleep_asked on x86_64 */
+ #endif
+     LONGLONG     ps5_sleep_asked;   /* microseconds of sleep asked since then */
+     char         debug_info[0x800]; /* debug_info structure */
+ #if defined(__x86_64__) && (defined(__PROSPERO__) || defined(WINE_INPROCESS_SERVER))
+     void        *ps5_sync_bop_context; /* atomic native transaction view, normally NULL */
++    void        *ps5_sync_bop_memory; /* current-thread bounded VM lease, normally NULL */
+ #endif
+     char         signal_stack[];    /* signal stack */
+     /* char kernel_stack[] */
+ };
+
+ extern pthread_key_t thread_data_key;
+
+ static inline struct thread_data *get_thread_data(void)
+diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -84,16 +84,19 @@
+ #include "ntstatus.h"
+ #include "windef.h"
+ #include "winnt.h"
+ #include "winternl.h"
+ #include "ddk/wdm.h"
+ #include "wine/list.h"
+ #include "wine/rbtree.h"
+ #include "unix_private.h"
++#if defined(__x86_64__) && (defined(__PROSPERO__) || defined(WINE_INPROCESS_SERVER))
++#include "wine/ps5_sync_bop_memory.h"
++#endif
+ #include "wine/debug.h"
+
+ WINE_DEFAULT_DEBUG_CHANNEL(virtual);
+ WINE_DECLARE_DEBUG_CHANNEL(module);
+ WINE_DECLARE_DEBUG_CHANNEL(virtual_ranges);
+
+ /* Host address-space accounting. Every mmap/munmap/mprotect issued by this
+  * file goes through the wrappers below, which count them and remember the
+@@ -5314,16 +5317,125 @@
+         memcpy( addr, buffer, size );
+         if (has_write_watch) update_write_watches( addr, size, size );
+     }
+     server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+     return ret;
+ }
+
+
++#if defined(__x86_64__) && (defined(__PROSPERO__) || defined(WINE_INPROCESS_SERVER))
++/* A short native lease keeps authoritative mappings stable through the CAS
++ * and output store. It neither probes by writing nor consumes guard pages. */
++C_ASSERT( sizeof(sigset_t) <= sizeof(((struct pw_sync_bop_memory_view *)0)->previous_mask) );
++
++static int ps5_sync_bop_memory_end( struct pw_sync_bop_memory_view *view )
++{
++    struct thread_data *data = get_thread_data();
++    sigset_t previous;
++
++    if (!data || !view || data->ps5_sync_bop_memory != view ||
++        view->version != PW_BOP_MEMORY_VERSION || view->size != sizeof(*view) ||
++        view->owner != (UINT_PTR)data) return 0;
++    view->state = PW_BOP_MEMORY_RECOVERY;
++    if (view->locked)
++    {
++        if (pthread_mutex_unlock( &virtual_mutex )) return 0;
++        view->locked = 0;
++    }
++    memcpy( &previous, view->previous_mask, sizeof(previous) );
++    if (pthread_sigmask( SIG_SETMASK, &previous, NULL )) return 0;
++    data->ps5_sync_bop_memory = NULL;
++    view->owner = 0;
++    view->state = PW_BOP_MEMORY_EMPTY;
++    return 1;
++}
++
++static uint32_t ps5_sync_bop_memory_begin( struct pw_sync_bop_memory_view *view )
++{
++    struct thread_data *data = get_thread_data();
++    sigset_t previous;
++
++    if (!data || !view || view->version != PW_BOP_MEMORY_VERSION ||
++        view->size != sizeof(*view) || data->ps5_sync_bop_memory)
++        return PW_BOP_MEMORY_EMPTY;
++    if (pthread_sigmask( SIG_BLOCK, &server_block_set, &previous )) return PW_BOP_MEMORY_EMPTY;
++    memcpy( view->previous_mask, &previous, sizeof(previous) );
++    view->owner = (UINT_PTR)data;
++    view->locked = 0;
++    view->state = PW_BOP_MEMORY_RECOVERY;
++    data->ps5_sync_bop_memory = view;
++    if (pthread_mutex_trylock( &virtual_mutex ))
++        return ps5_sync_bop_memory_end( view ) ? PW_BOP_MEMORY_EMPTY : PW_BOP_MEMORY_RECOVERY;
++    view->locked = 1;
++    view->state = PW_BOP_MEMORY_HELD;
++    return PW_BOP_MEMORY_HELD;
++}
++
++static int ps5_sync_bop_memory_span( struct pw_sync_bop_memory_view *view,
++                                     uint32_t address, uint32_t bytes, int write )
++{
++    struct thread_data *data = get_thread_data();
++    const char *ptr = ULongToPtr( address );
++    struct file_view *mapping;
++    SIZE_T remaining = bytes, chunk;
++    BYTE prot;
++
++    if (!data || !view || data->ps5_sync_bop_memory != view ||
++        view->version != PW_BOP_MEMORY_VERSION || view->size != sizeof(*view) ||
++        view->owner != (UINT_PTR)data || view->state != PW_BOP_MEMORY_HELD || !view->locked ||
++        !bytes || bytes > PW_BOP_MEMORY_MAX_BYTES || address < 0x10000 ||
++        address >= 0xfffff000u || bytes > 0xfffff000u - address) return 0;
++    if (!(mapping = find_view( ptr, bytes )) || (mapping->protect & VPROT_SYSTEM)) return 0;
++    while (remaining)
++    {
++        prot = get_host_page_vprot( ptr );
++        if (!(get_unix_prot( prot ) & PROT_READ) || (prot & (VPROT_GUARD | VPROT_WRITEWATCH))) return 0;
++        if (write && (!(get_unix_prot( prot ) & PROT_WRITE) || (prot & VPROT_WRITECOPY))) return 0;
++        chunk = min( remaining, host_page_size - ((UINT_PTR)ptr & host_page_mask) );
++        ptr += chunk;
++        remaining -= chunk;
++    }
++    return 1;
++}
++
++static int ps5_sync_bop_memory_read( struct pw_sync_bop_memory_view *view,
++                                     uint32_t address, void *out, uint32_t bytes )
++{
++    if (!out || !ps5_sync_bop_memory_span( view, address, bytes, 0 )) return 0;
++    memcpy( out, ULongToPtr(address), bytes );
++    return 1;
++}
++
++static int ps5_sync_bop_memory_writable( struct pw_sync_bop_memory_view *view,
++                                         uint32_t address, uint32_t bytes )
++{
++    return ps5_sync_bop_memory_span( view, address, bytes, 1 );
++}
++
++static uint32_t ps5_sync_bop_memory_write( struct pw_sync_bop_memory_view *view,
++                                          uint32_t address, const void *in, uint32_t bytes )
++{
++    if (!in || !ps5_sync_bop_memory_span( view, address, bytes, 1 )) return STATUS_ACCESS_VIOLATION;
++    memcpy( ULongToPtr(address), in, bytes );
++    return STATUS_SUCCESS;
++}
++
++DECLSPEC_EXPORT const struct pw_sync_bop_memory_backend *__wine_ps5_sync_bop_memory_backend(uint32_t version)
++{
++    static const struct pw_sync_bop_memory_backend api =
++    {
++        PW_BOP_MEMORY_VERSION, sizeof(api), sizeof(void *), sizeof(struct pw_sync_bop_memory_view),
++        ps5_sync_bop_memory_begin, ps5_sync_bop_memory_end, ps5_sync_bop_memory_read,
++        ps5_sync_bop_memory_writable, ps5_sync_bop_memory_write
++    };
++    return version == PW_BOP_MEMORY_VERSION ? &api : NULL;
++}
++#endif
++
+ /***********************************************************************
+  *           virtual_set_force_exec
+  *
+  * Whether to force exec prot on all views.
+  */
+ void virtual_set_force_exec( BOOL enable )
+ {
+     struct file_view *view;
+diff --git a/include/wine/ps5_sync_bop_memory.h b/include/wine/ps5_sync_bop_memory.h
+new file mode 100644
+--- /dev/null
++++ b/include/wine/ps5_sync_bop_memory.h
+@@ -0,0 +1,31 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#ifndef __WINE_PS5_SYNC_BOP_MEMORY_H
++#define __WINE_PS5_SYNC_BOP_MEMORY_H
++#include <stdint.h>
++#define PW_BOP_MEMORY_VERSION 1u
++#define PW_BOP_MEMORY_EMPTY 0u
++#define PW_BOP_MEMORY_HELD 1u
++#define PW_BOP_MEMORY_RECOVERY 2u
++#define PW_BOP_MEMORY_MAX_BYTES 32u
++/* Trusted native storage. Caller retains it until end succeeds, including
++ * RECOVERY on a mocked OS refusal. Fields after size are backend-owned. */
++struct pw_sync_bop_memory_view
++{
++    uint32_t version, size, state, locked;
++    uint64_t owner, previous_mask[4];
++};
++struct pw_sync_bop_memory_backend
++{
++    uint32_t version, size, pointer_size, view_size;
++    /* EMPTY means ordinary fallback; HELD permits scalar memory accesses.
++     * RECOVERY requires end before discarding storage or resuming the guest. */
++    uint32_t (*begin)(struct pw_sync_bop_memory_view *);
++    int (*end)(struct pw_sync_bop_memory_view *);
++    int (*read)(struct pw_sync_bop_memory_view *, uint32_t, void *, uint32_t);
++    int (*writable)(struct pw_sync_bop_memory_view *, uint32_t, uint32_t);
++    /* NTSTATUS: zero success. Output must have passed writable before CAS.
++     * Keep the lease through CAS/output. End before context finish, so
++     * queued observers see the still-published complete guest context. */
++    uint32_t (*write)(struct pw_sync_bop_memory_view *, uint32_t, const void *, uint32_t);
++};
++#endif

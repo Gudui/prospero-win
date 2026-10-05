@@ -570,3 +570,34 @@ This interface remains inactive. CPU-loaded module binding, protected guest
 access, run-loop/reset/diagnostic integration and complete console semantic,
 performance, load and stability gates are still required. Native component
 checks do not establish a speed gain or meet the city58/50 goal.
+
+### Native bounded guest-memory lease dependency
+
+Patch 0892 prepares a native memory interface for the transaction adapter.
+Begin uses Wine's existing signal set and a nonblocking attempt at its VM
+mutex. Under a held lease, reads and output preflight check every affected
+host page before copying at most 32 bytes. Checks do not write probes or
+consume guard-page state. Unavailable, system, guarded or write-watch spans
+decline; output copies also decline copy-on-write spans. The ordinary path
+remains responsible for those cases before any object operation occurs.
+
+The consumer must keep the lease through argument capture, output preflight,
+CAS and output store. It must end the memory lease before finishing the
+published context view, so queued context observers still see the complete
+guest view when the old signal mask is restored. A mocked unlock or mask
+restoration refusal retains an explicit recovery token; its native storage
+must remain valid until end succeeds. Guest execution cannot resume during
+that recovery. Begin/end add a mask/unmask pair; this cost needs console
+measurement even though the warm object CAS itself remains mask-free.
+
+`python3 tests/test_wine_sync_bop_memory.py` compiles the actual memory bodies
+against explicit page, OS and context mocks. It checks all-page preflight,
+unchanged buffers on refusal, page crossings, nonmutating output checks,
+bounded mocked recovery, and ten transactions through the actual scalar
+adapter with queued observer replacements. No real Wine process, signal,
+guest mapping or fault is executed. The native ABI still requires complete
+SDK compilation and ordinary console gates.
+
+There is no runtime consumer or activation in this dependency. CPU-loaded
+identity/lifetime, run-loop FP/reset/diagnostic handling and complete console
+semantic, performance, load and stability gates remain pending.

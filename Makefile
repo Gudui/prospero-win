@@ -162,6 +162,7 @@ test: $(addprefix $(BUILD)/,$(TESTS)) $(BUILD)/classify_x86 $(BUILD)/dbt_differe
 	CC="$(CC)" CFLAGS="$(CFLAGS)" python3 tests/test_wow_sync_bop_adapter.py
 	CC="$(CC)" CFLAGS="$(CFLAGS)" python3 tests/test_wow_sync_bop_bindings.py
 	CC="$(CC)" CFLAGS="$(CFLAGS)" python3 tests/test_wine_sync_bop_context.py
+	CC="$(CC)" CFLAGS="$(CFLAGS)" python3 tests/test_wine_sync_bop_memory.py
 	CC="$(CC)" CFLAGS="$(CFLAGS)" python3 tests/test_wine_shared_mutex_client.py
 	CC="$(CC)" CFLAGS="$(CFLAGS)" python3 tests/test_ws2_fqdn_cache.py
 	python3 tests/test_pw_install.py
