@@ -845,9 +845,9 @@ static void test_call_predict_site(void)
         { 0, 0, 0 },    /* a missing: looked up, missed */
         { 0, 1, 1 },    /* a listed: looked up, trains */
         { 0, 0, 1 },    /* a missing: predicted */
-        { 1, 1, 2 },    /* other listed: looked up */
+        { 1, 1, 2 },    /* other listed: looked up, trains the second slot */
         { 0, 0, 1 },    /* a missing: still predicted */
-        { 1, 0, 0 },    /* other missing: looked up, missed */
+        { 1, 0, 2 },    /* other missing: predicted by the second slot */
     };
     for (unsigned f = 0; f < sizeof(flags) / sizeof(flags[0]); f++) {
         assert(pw_x86_reencode(caller, sizeof(caller), pc, code, page, &block, &options) == PW_OK);
@@ -1167,6 +1167,49 @@ static void test_jump_predict(void)
     same(&plain, &emitter);
     same(&predicted, &emitter);
     same(&production, &emitter);
+}
+
+/* A call site cycling through three targets, more than prediction learns:
+ * the first two are predicted, the third keeps the lookup, and the result
+ * matches the emitter's. */
+static void test_call_predict_three_targets(void)
+{
+    enum { F1 = 0x40, F2 = 0x48, F3 = 0x50, TABLE = 0x30000 };
+    static const uint8_t program[] = {
+        0xb8, 0, 0, 0, 0,                   /* 00 mov eax, table */
+        0xb9, 99, 0, 0, 0,                  /* 05 mov ecx, 99 */
+        0x31, 0xf6,                         /* 0a xor esi, esi */
+        0xff, 0x14, 0xb0,                   /* 0c L: call [eax+esi*4] */
+        0x46,                               /* 0f inc esi */
+        0x83, 0xfe, 0x03,                   /* 10 cmp esi, 3 */
+        0x75, 0x02,                         /* 13 jne K */
+        0x31, 0xf6,                         /* 15 xor esi, esi */
+        0x49,                               /* 17 K: dec ecx */
+        0x75, 0xf2,                         /* 18 jnz L */
+        0xc3,                               /* 1a ret */
+    };
+    static const uint8_t f1[] = { 0x83, 0xc3, 0x01, 0xc3 };   /* add ebx, 1 */
+    static const uint8_t f2[] = { 0x83, 0xc7, 0x03, 0xc3 };   /* add edi, 3 */
+    static const uint8_t f3[] = { 0x83, 0xc5, 0x05, 0xc3 };   /* add ebp, 5 */
+    const uint32_t code = low + CODE, table = low + TABLE;
+    const uint32_t targets[3] = { code + F1, code + F2, code + F3 };
+    uint8_t image[0x60];
+    Run emitter, predicted;
+
+    memset(image, 0xcc, sizeof(image));
+    memcpy(image, program, sizeof(program));
+    memcpy(image + 1, &table, 4);
+    memcpy(image + F1, f1, sizeof(f1));
+    memcpy(image + F2, f2, sizeof(f2));
+    memcpy(image + F3, f3, sizeof(f3));
+    memcpy(guest + TABLE, targets, sizeof(targets));
+    emitter = run(image, sizeof(image), 0);
+    call_predict = 1;
+    predicted = run_production(image, sizeof(image));
+    call_predict = 0;
+    assert(emitter.status == PW_OK && emitter.state.eip == 0xdead0000u);
+    assert(emitter.state.gpr[3] == 0x44444444u + 33 && emitter.state.gpr[5] == 0x66666666u + 33 * 5);
+    same(&predicted, &emitter);
 }
 
 /* A branchy loop whose side exits are taken on alternate iterations, and
@@ -2953,6 +2996,7 @@ int main(void)
     test_superblocks();
     test_call_predict_site();
     test_call_predict_engine();
+    test_call_predict_three_targets();
     test_call_landings();
     test_jump_tables();
     test_two_level_jump_tables();

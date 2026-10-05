@@ -1288,29 +1288,16 @@ static void lea_r8_code(Out *o, size_t at)
  * an entry without code trains nothing. The site is the thread's own code
  * and goes with its arena generation; a target that differs later keeps the
  * lookup without rewriting anything. */
-static void emit_predicted_call(Ctx *c, size_t call_rel)
+/* The training path of predicted slot k (emit_predicted_call), with the
+ * hit's chain entry in r11: learned (the lea's displacement) becomes
+ * -target, link (the hit's jmp rel32) the chain entry, and the hook (the
+ * lookup's rel32) next_hook, the next slot's training path, or 0 (on to
+ * jmp r11) after the last. Returns where next_hook's imm32 is, to patch. */
+static size_t emit_predict_training(Ctx *c, size_t learned, size_t link, size_t hook)
 {
     Out *o = &c->o;
-    size_t hit, link, learned, hook, to_skip, over = 0;
-    ptrdiff_t back;
+    size_t to_skip, next_hook;
 
-    /* A jump (emit_predicted_jump) goes over the hit to the site. */
-    if (!call_rel) over = jump8(o, 0xeb);
-    hit = o->n;
-    mov_rcx_r9(o);
-    link = jump32(o);                                               /* jmp learned */
-    if (call_rel) land32(o, call_rel);
-    else land8(o, over);
-    mov_r9_rcx(o);
-    b(o, 0x41); b(o, 0x8d); b(o, 0x8a); learned = o->n; w32(o, 0);  /* lea ecx, [r10+0] */
-    back = (ptrdiff_t)hit - (ptrdiff_t)(o->n + 2);
-    if (back < -128) o->failed = 1;
-    b(o, 0xe3); b(o, (uint8_t)(int8_t)back);                        /* jrcxz hit */
-    mov_rcx_r9(o);
-    land32(o, link);                                                /* untrained: the lookup */
-    emit_dynamic_exit_hooked(c, &hook);
-    /* The training path, with the hit's chain entry in r11. */
-    land32(o, hook);
     mov_r9_rcx(o);
     rr(o, 0x89, 1, 1, R11);                                         /* mov rcx, r11 */
     to_skip = jump8(o, 0xe3);                                       /* jrcxz skip: no code */
@@ -1326,11 +1313,64 @@ static void emit_predicted_call(Ctx *c, size_t call_rel)
     b(o, 0x4f); b(o, 0x8d); b(o, 0x4c); b(o, 0x0b); b(o, 1);        /* lea r9, [r11+r9+1] */
     b(o, 0x45); b(o, 0x89); b(o, 0x08);                             /* mov [r8], r9d */
     lea_r8_code(o, hook);
-    b(o, 0x41); b(o, 0xc7); b(o, 0x00); w32(o, 0);                  /* mov dword [r8], 0 */
+    b(o, 0x41); b(o, 0xc7); b(o, 0x00); next_hook = o->n; w32(o, 0); /* mov dword [r8], next */
     b(o, 0x41); b(o, 0xff); b(o, 0xe3);                             /* jmp r11 */
     land8(o, to_skip);
     mov_rcx_r9(o);
     b(o, 0x41); b(o, 0xff); b(o, 0xe3);                             /* jmp r11 */
+    return next_hook;
+}
+
+/* The callee of a dynamic call (or the target of a jump), predicted at the
+ * site: two learned targets, each compared and, on a match, jumped to
+ * straight, without flags:
+ *
+ *     hit1: mov rcx, r9; jmp learned1's chain entry
+ *     hit2: mov rcx, r9; jmp learned2's chain entry
+ *     site: mov r9, rcx; lea ecx, [r10 - learned1]; jrcxz hit1;
+ *           lea ecx, [r10 - learned2]; jrcxz hit2; mov rcx, r9
+ *           (the chain table lookup of r10d)
+ *
+ * Untrained, a learned target is 0 and its hit's jump goes to the lookup,
+ * so every target, 0 included, is looked up. The lookup's first hit trains
+ * the first slot, its next hit (another target) the second: the hook runs
+ * the first slot's training path, which points the hook at the second's,
+ * which clears it (rel32 0: on to jmp r11). Each state between the writes
+ * still sends every target where it belongs; an entry without code trains
+ * nothing. Other targets keep the lookup. */
+static void emit_predicted_call(Ctx *c, size_t call_rel)
+{
+    Out *o = &c->o;
+    size_t hit[2], link[2], learned[2], hook, next[2], train[2], over = 0;
+
+    /* A jump (emit_predicted_jump) goes over the hits to the site. */
+    if (!call_rel) over = jump8(o, 0xeb);
+    for (unsigned k = 0; k < 2; k++) {
+        hit[k] = o->n;
+        mov_rcx_r9(o);
+        link[k] = jump32(o);                                        /* jmp learned k */
+    }
+    if (call_rel) land32(o, call_rel);
+    else land8(o, over);
+    mov_r9_rcx(o);
+    for (unsigned k = 0; k < 2; k++) {
+        ptrdiff_t back;
+        b(o, 0x41); b(o, 0x8d); b(o, 0x8a); learned[k] = o->n; w32(o, 0); /* lea ecx, [r10+0] */
+        back = (ptrdiff_t)hit[k] - (ptrdiff_t)(o->n + 2);
+        if (back < -128) o->failed = 1;
+        b(o, 0xe3); b(o, (uint8_t)(int8_t)back);                    /* jrcxz hit k */
+    }
+    mov_rcx_r9(o);
+    land32(o, link[0]);                                             /* untrained: the lookup */
+    land32(o, link[1]);
+    emit_dynamic_exit_hooked(c, &hook);
+    for (unsigned k = 0; k < 2; k++) {
+        train[k] = o->n;
+        if (!k) land32(o, hook);
+        next[k] = emit_predict_training(c, learned[k], link[k], hook);
+    }
+    /* The first slot's training points the hook at the second's. */
+    put32(o, next[0], (uint32_t)(train[1] - (hook + 4)));
 }
 
 /* A jump to the guest EIP in r10d through an absolute address, an import

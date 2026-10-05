@@ -456,7 +456,8 @@ it afterwards; you can name more than one.
 
 Two files switch translator features off for a comparison run:
 `pw_wow_no_jump_tables` keeps the table lookup for switch statements, and
-`pw_wow_no_jump_predict` keeps it for import thunks and `call [import]`
+`pw_wow_no_jump_predict` keeps it for import thunks and `call [import]`, and
+`pw_wow_no_call_predict` for calls through a register or memory
 (see [the benchmark log](DBT_BENCHMARK.md#switches-import-thunks-and-call-returns)).
 
 They report through the game's log, which the console saves after every run

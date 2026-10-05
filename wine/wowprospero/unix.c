@@ -534,15 +534,15 @@ static struct pw_thread *get_thread(void)
                                  (!getenv( "PW_WOW_NATIVE_FP" ) || strcmp( getenv( "PW_WOW_NATIVE_FP" ), "0" )) );
     pw_x86_engine_set_superblocks( &thread->engine, thread->engine.unbounded_chains &&
                                    (!getenv( "PW_WOW_SUPERBLOCKS" ) || strcmp( getenv( "PW_WOW_SUPERBLOCKS" ), "0" )) );
-    /* Calls through a register or memory learn their target in the same
-     * writable code, as side exits do; off unless PW_WOW_CALL_PREDICT=1 or,
-     * on the console, /data/prospero-win/pw_wow_call_predict exists. */
+    /* Calls through a register or memory learn up to two targets in the
+     * same writable code, as side exits do (PW_WOW_CALL_PREDICT=0, or on the
+     * console /data/prospero-win/pw_wow_no_call_predict, keeps the lookup). */
     {
-        int predict = getenv( "PW_WOW_CALL_PREDICT" ) && !strcmp( getenv( "PW_WOW_CALL_PREDICT" ), "1" );
+        int predict = !getenv( "PW_WOW_CALL_PREDICT" ) || strcmp( getenv( "PW_WOW_CALL_PREDICT" ), "0" );
 #ifdef __PROSPERO__
         struct stat predict_st;
 
-        if (!stat( "/data/prospero-win/pw_wow_call_predict", &predict_st )) predict = 1;
+        if (!stat( "/data/prospero-win/pw_wow_no_call_predict", &predict_st )) predict = 0;
 #endif
         pw_x86_engine_set_call_predict( &thread->engine, thread->engine.superblocks && predict );
     }

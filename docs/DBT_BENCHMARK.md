@@ -1139,3 +1139,17 @@ samples (`hotcum` lines), so a module breakdown no longer depends on the
 top of each window. With `pw_wow_timing`, the first thread's cache report
 lists the host pages that went back to source checks (`smc_checked`).
 
+### Call prediction on by default, with two targets
+
+The PS5 profile of San Andreas is flat: the 20 hottest blocks of each
+five-second window hold only 15% of the main thread's samples, so no single
+function is worth chasing, and the costs that every call pays matter most.
+Calls through a register or memory (COM methods, Proper Shaders' Direct3D
+proxy forwarding to DXVK, d3dx9's preshader operations) now predict by
+default (`pw_wow_no_call_predict` turns it off), and each site learns two
+targets instead of one: a site alternating between two callees (a proxy
+method reached from two objects, an interpreter's two most common
+operations) no longer looks every other call up. A third target keeps the
+lookup, as a second one did before; a miss costs two more flag-free
+instructions than it did.
+
