@@ -510,8 +510,9 @@ The helper validates the pinned Wine stub forms, matching service IDs,
 bounds. It records each stub's return address and rejects duplicate IDs,
 other syscall tables, custom stubs, incomplete images and read refusals.
 At most eleven reads occur; failure leaves the destination unchanged.
-The current console Wine build uses the recognized non-PIC PE32 form;
-unrecognized forms retain ordinary dispatch.
+The inspected pinned Wine PE32 build uses the recognized non-PIC form;
+the loaded runtime must still be checked. Unrecognized forms retain ordinary
+dispatch.
 
 `python3 tests/test_wow_sync_bop_bindings.py` checks ordinary synthetic stub
 data, every byte of all five stub pairs, bounds and eleven mocked read
