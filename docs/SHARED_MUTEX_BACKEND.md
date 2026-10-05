@@ -390,6 +390,29 @@ It requires its own register/stack/FP, signal, module and diagnostic
 contracts. This avoids adding a guest-writable arena or changing PE
 modules. No BOP interception exists in this experimental backend.
 
+Patch 0890 prepares a native warm-cache-only interface for that later adapter.
+`__wine_ps5_sync_bop_backend` discovers a versioned table with checked structure
+and native pointer sizes and an exact operation mask. Its scalar call supports
+non-alertable single-object acquisition, mutex release, event set/reset and
+semaphore release. It shares the existing client CAS helpers; their ordinary
+entry points retain cold fills, while the native entry forbids them. Cold or
+negative handles, missing thread tokens, disabled backends, missing permissions,
+contention and retired cells return a miss without changing result storage.
+The caller must pass native local result storage; no guest pointer, syscall
+number or guest context crosses this interface. The native module must remain
+loaded for the table's lifetime.
+
+`python3 tests/test_wine_sync_bop_backend.py` compiles the actual header and
+helper bodies. It checks ABI rejection, 24,000 warm operations, independent
+access rights, recursion and ownership, cold/negative/disabled fallback,
+retirement and handle reuse, original cold wrappers, and 8,000 legal concurrent
+semaphore critical sections. It also verifies that removing the warm-only
+parameter and early exit reproduces the prior ordinary helper bodies exactly.
+These bounded native checks do not establish Wine fault or asynchronous context
+behavior. Patch 0890 adds no translator consumer or activation, and claims no
+FPS improvement. Guest stack and output access, syscall identity, FP ownership,
+signals, thread-context resets and diagnostics remain adapter validation gates.
+
 ## Checks
 
 `python3 tests/test_wine_shared_mutex_word.py` compiles the exact header
