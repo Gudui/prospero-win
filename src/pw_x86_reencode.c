@@ -1342,31 +1342,53 @@ static void emit_predicted_jump(Ctx *c)
     emit_predicted_call(c, 0);
 }
 
-/* The entries of a jump through a table that the two instructions before it
- * bound, a switch's dispatch: cmp r, n; ja (or jae) out of it; jmp
- * [r*4+table], with no base or segment; or 0. The jcc is a side exit, so
- * the jmp runs only for an index in the table. */
-static uint32_t jump_table_entries(const Inst *insts, unsigned k)
+/* The number of values r can have after cmp r, imm; ja (or jae) past what
+ * follows: in[k] and in[k + 1]; or 0. The jcc is a side exit, so the code
+ * after it runs only for r below that. */
+static uint32_t bounded_values(const Inst *insts, unsigned k, unsigned r, uint32_t most)
 {
-    const Inst *j = &insts[k], *jcc, *cmp;
+    const Inst *cmp = &insts[k], *jcc = &insts[k + 1];
     uint32_t limit;
+
+    if (jcc->kind != K_JCC || (jcc->cond != 0x7 && jcc->cond != 0x3)) return 0;
+    if (cmp->opsize16 || cmp->lock || cmp->fs) return 0;
+    if (cmp->kind == K_RM && cmp->op_len == 1 && (cmp->op[0] == 0x83 || cmp->op[0] == 0x81) &&
+        cmp->reg == 7 && cmp->mod == 3 && cmp->rm == r)
+        limit = cmp->op[0] == 0x83 ? (uint32_t)(int32_t)(int8_t)cmp->imm[0] : rd32(cmp->imm);
+    else if (cmp->kind == K_PLAIN && cmp->len == 5 && cmp->bytes[0] == 0x3d && r == 0)
+        limit = rd32(cmp->bytes + 1);                               /* cmp eax, imm32 */
+    else
+        return 0;
+    if (jcc->cond == 0x7) return limit < most ? limit + 1 : 0;      /* ja: r <= limit */
+    return limit && limit <= most ? limit : 0;                      /* jae: r < limit */
+}
+
+/* The entries of the block's last instruction, a jump through a table of
+ * 4-byte entries whose index the instructions just before it bound, a
+ * switch's dispatch; or 0. Either cmp r, n; ja (or jae) default; jmp
+ * [r*4+table], or MSVC's two-level form, cmp s, n; ja default; movzx r, byte
+ * [s+bytes]; jmp [r*4+table], where the index is one of the n+1 bytes,
+ * read with read_trusted. */
+static uint32_t jump_table_entries(const Inst *insts, unsigned k, const PwX86TranslateOptions *options)
+{
+    const Inst *j = &insts[k], *m;
+    uint32_t count, most = 0;
+    const uint8_t *bytes;
 
     if (k < 2 || j->kind != K_JMPRM || j->mod == 3 || j->fs || j->opsize16 ||
         j->ea.base >= 0 || j->ea.index < 0 || j->ea.scale != 2)
         return 0;
-    jcc = &insts[k - 1];
-    cmp = &insts[k - 2];
-    if (jcc->kind != K_JCC || (jcc->cond != 0x7 && jcc->cond != 0x3)) return 0;
-    if (cmp->opsize16 || cmp->lock || cmp->fs) return 0;
-    if (cmp->kind == K_RM && cmp->op_len == 1 && (cmp->op[0] == 0x83 || cmp->op[0] == 0x81) &&
-        cmp->reg == 7 && cmp->mod == 3 && cmp->rm == (unsigned)j->ea.index)
-        limit = cmp->op[0] == 0x83 ? (uint32_t)(int32_t)(int8_t)cmp->imm[0] : rd32(cmp->imm);
-    else if (cmp->kind == K_PLAIN && cmp->len == 5 && cmp->bytes[0] == 0x3d && j->ea.index == 0)
-        limit = rd32(cmp->bytes + 1);                               /* cmp eax, imm32 */
-    else
+    if ((count = bounded_values(insts, k - 2, (unsigned)j->ea.index, MAX_TABLE))) return count;
+    m = &insts[k - 1];
+    if (k < 3 || m->kind != K_RM || m->op_len != 2 || m->op[0] != 0x0f || m->op[1] != 0xb6 ||
+        m->mod == 3 || m->fs || m->opsize16 || m->reg != (unsigned)j->ea.index ||
+        m->ea.base < 0 || m->ea.index >= 0)
         return 0;
-    if (jcc->cond == 0x7) return limit < MAX_TABLE ? limit + 1 : 0;     /* ja: index <= limit */
-    return limit && limit <= MAX_TABLE ? limit : 0;                     /* jae: index < limit */
+    if (!(count = bounded_values(insts, k - 3, (unsigned)m->ea.base, 4 * MAX_TABLE)) ||
+        !options->read_trusted(options->read_opaque, m->ea.disp, count, &bytes))
+        return 0;
+    for (uint32_t i = 0; i < count; i++) if (bytes[i] > most) most = bytes[i];
+    return most < MAX_TABLE ? most + 1 : 0;
 }
 
 /* The jump through the block's table: the index (zero-extended) selects
@@ -2044,7 +2066,7 @@ int pw_x86_reencode(const uint8_t *source, size_t bytes, uint32_t pc,
     c.source_bytes = bytes;
     c.native_fp = options->native_fp;
     if (superblocks && options->jump_tables && options->read_trusted &&
-        (c.table_entries = jump_table_entries(insts, count - 1)) &&
+        (c.table_entries = jump_table_entries(insts, count - 1, options)) &&
         !options->read_trusted(options->read_opaque, insts[count - 1].ea.disp,
                                4 * (size_t)c.table_entries, &c.table_bytes))
         c.table_entries = 0;

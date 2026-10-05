@@ -1105,7 +1105,9 @@ latency on top of the guest's own.
   and trusted only where source would be: a table on a writable page that
   is not write-protected for its translations keeps the lookup, and a
   change to a trusted one discards the translation as a change to code
-  does. At most 120 entries.
+  does. MSVC's two-level form (`cmp s, n; ja default; movzx r, byte
+  [s+bytes]; jmp [r*4+table]`) is taken too: the index is one of the n+1
+  bytes, read the same way. At most 120 entries.
 - **Import thunks.** `jmp [address]` learns its target as a predicted call
   does (`call_predict`): five flag-free instructions compare the target
   with the learned one and jump straight to its chain entry; another target

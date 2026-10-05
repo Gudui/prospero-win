@@ -1065,6 +1065,53 @@ static void test_jump_tables(void)
     assert(tables.steps < 60);
 }
 
+/* MSVC's two-level switch: cmp, ja, then movzx of the index from a byte
+ * table, then the jump through the table it indexes; flags from the compare
+ * read by a target. The same as the emitter, with the table taken. */
+static void test_two_level_jump_tables(void)
+{
+    enum { BYTES = 0x80, T = 0x90 };
+    static const uint8_t program[] = {
+        0xb9, 0x2c, 0x01, 0, 0,             /* 00 mov ecx, 300 */
+        0x31, 0xdb,                         /* 05 xor ebx, ebx */
+        0x89, 0xc8,                         /* 07 L: mov eax, ecx */
+        0x83, 0xe0, 0x07,                   /* 09 and eax, 7 */
+        0x83, 0xf8, 0x05,                   /* 0c cmp eax, 5 */
+        0x77, 0x1b,                         /* 0f ja D (2c) */
+        0x0f, 0xb6, 0x90, 0, 0, 0, 0,       /* 11 movzx edx, byte [eax+BYTES] */
+        0xff, 0x24, 0x95, 0, 0, 0, 0,       /* 18 jmp [edx*4+T] */
+        0x83, 0xc3, 0x01, 0xeb, 0x0e,       /* 1f C0: add ebx, 1; jmp N (32) */
+        0x83, 0xd3, 0x0a, 0xeb, 0x09,       /* 24 C1: adc ebx, 10 (CF: eax < 5); jmp N */
+        0x90, 0x90, 0x90,                   /* 29 */
+        0x83, 0xeb, 0x03,                   /* 2c D: sub ebx, 3 */
+        0x90, 0x90, 0x90,                   /* 2f */
+        0x49,                               /* 32 N: dec ecx */
+        0x75, 0xd2,                         /* 33 jnz L (07) */
+        0xc3,                               /* 35 ret */
+    };
+    static const uint8_t bytes[6] = { 0, 1, 1, 0, 1, 0 };
+    const uint32_t code = low + CODE;
+    const uint32_t entries[2] = { code + 0x1f, code + 0x24 };
+    uint8_t image[0xa0];
+    Run emitter, tables;
+
+    memset(image, 0xcc, sizeof(image));
+    memcpy(image, program, sizeof(program));
+    memcpy(image + 0x14, &(uint32_t){ code + BYTES }, 4);
+    memcpy(image + 0x1b, &(uint32_t){ code + T }, 4);
+    memcpy(image + BYTES, bytes, sizeof(bytes));
+    memcpy(image + T, entries, sizeof(entries));
+    emitter = run(image, sizeof(image), 0);
+    jump_tables = 1;
+    native_fp = fault_markers = 1;
+    tables = run_superblocks(image, sizeof(image));
+    native_fp = fault_markers = 0;
+    jump_tables = 0;
+    assert(emitter.status == PW_OK && emitter.state.eip == 0xdead0000u);
+    same(&tables, &emitter);
+    assert(tables.tables >= 1);
+}
+
 /* An import thunk, jmp [slot], and an import call, call [slot2], with jump
  * prediction: each learns its target, the program then changes both slots,
  * and later calls go to the new target (the prediction misses and looks it
@@ -2904,6 +2951,7 @@ int main(void)
     test_call_predict_engine();
     test_call_landings();
     test_jump_tables();
+    test_two_level_jump_tables();
     test_jump_predict();
     test_strings();
     test_native_fp();
