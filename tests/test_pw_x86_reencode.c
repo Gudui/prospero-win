@@ -1232,13 +1232,17 @@ static void test_strings(void)
      * the emitter's side) runs on the host. */
     hostexec_fallback = 1;
     compare(code, sizeof(code));
-    r = run_superblocks(lods, sizeof(lods));
+    /* With fault markers as well, where single lods forwards are plain
+     * moves (emit_string). */
+    for (unsigned production = 0; production < 2; production++) {
+        r = production ? run_production(lods, sizeof(lods)) : run_superblocks(lods, sizeof(lods));
+        assert(r.status == PW_OK && r.state.eip == 0xdead0000u);
+        assert(r.state.gpr[3] == pattern(35));                          /* lodsl */
+        assert((r.state.gpr[0] & 0xffffff00u) == ((pattern(35) & 0xffff0000u) | (pattern(39) & 0xff00u)));
+        assert((r.state.gpr[0] & 0xff) == (pattern(41) & 0xff));         /* lodsb after std */
+        assert(r.state.gpr[6] == low + DATA + 40);                      /* esi went back one */
+    }
     hostexec_fallback = 0;
-    assert(r.status == PW_OK && r.state.eip == 0xdead0000u);
-    assert(r.state.gpr[3] == pattern(35));                              /* lodsl */
-    assert((r.state.gpr[0] & 0xffffff00u) == ((pattern(35) & 0xffff0000u) | (pattern(39) & 0xff00u)));
-    assert((r.state.gpr[0] & 0xff) == (pattern(41) & 0xff));             /* lodsb after std */
-    assert(r.state.gpr[6] == low + DATA + 40);                          /* esi went back one */
 }
 
 static void test_native_fp(void)

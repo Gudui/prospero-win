@@ -1534,16 +1534,25 @@ static const uint8_t df_set[256] = {
 static void emit_string(Ctx *c, const Inst *in)
 {
     Out *o = &c->o;
-    size_t to_forward;
+    const unsigned op = in->op[0], width = in->width;
+    /* A single movs, stos or lods with fault markers: forwards (DF clear,
+     * the usual case) as plain moves and leas on esi and edi, each access
+     * listed in the fault table; backwards as the host's. */
+    const int simple = c->fault_markers && !in->rep &&
+                       (op == 0xa4 || op == 0xa5 || op == 0xaa || op == 0xab || op == 0xac || op == 0xad);
+    size_t to_forward, to_done = 0;
 
     mov_r9_rcx(o);
     b(o, 0x49); b(o, 0xbb); w64(o, (uint64_t)(uintptr_t)df_set);   /* movabs r11, df_set */
     b(o, 0x0f); b(o, 0xb6); b(o, 0x8f); w32(o, (uint32_t)offsetof(PwX86State, eflags) + 1);  /* movzx ecx, byte [rdi+eflags+1] */
     b(o, 0x41); b(o, 0x0f); b(o, 0xb6); b(o, 0x0c); b(o, 0x0b);    /* movzx ecx, byte [r11+rcx] */
     to_forward = jump8(o, 0xe3);                                    /* jrcxz forward */
+    if (simple) mov_rcx_r9(o);
     b(o, 0xfd);                                                     /* std */
-    land8(o, to_forward);
-    mov_rcx_r9(o);
+    if (!simple) {
+        land8(o, to_forward);
+        mov_rcx_r9(o);
+    }
     b(o, 0x4c); b(o, 0x87); b(o, 0xef);                             /* xchg rdi, r13 */
     if (in->rep) b(o, in->rep);
     if (in->opsize16) b(o, 0x66);
@@ -1551,6 +1560,21 @@ static void emit_string(Ctx *c, const Inst *in)
     b(o, in->op[0]);
     b(o, 0x4c); b(o, 0x87); b(o, 0xef);                             /* xchg rdi, r13 */
     b(o, 0xfc);                                                     /* cld */
+    if (!simple) return;
+    to_done = jump8(o, 0xeb);                                       /* jmp done */
+    land8(o, to_forward);
+    mov_rcx_r9(o);
+    if (op == 0xa4 || op == 0xa5) {                                 /* movs: r10 = [esi]; [edi] = r10 */
+        emit_frame_access_width(c, width == 1 ? 0x8a : 0x8b, R10, 6, 0, 0, 0, width);
+        emit_frame_access_width(c, width == 1 ? 0x88 : 0x89, R10, 7, 0, 1, 0, width);
+    } else if (op == 0xaa || op == 0xab) {                          /* stos: [edi] = al, ax, eax */
+        emit_frame_access_width(c, width == 1 ? 0x88 : 0x89, 0, 7, 0, 1, 0, width);
+    } else {                                                        /* lods: al, ax, eax = [esi] */
+        emit_frame_access_width(c, width == 1 ? 0x8a : 0x8b, 0, 6, 0, 0, 0, width);
+    }
+    if (op != 0xaa && op != 0xab) { b(o, 0x8d); b(o, 0x76); b(o, (uint8_t)width); }               /* lea esi, [rsi+w] */
+    if (op != 0xac && op != 0xad) { b(o, 0x45); b(o, 0x8d); b(o, 0x6d); b(o, (uint8_t)width); }   /* lea r13d, [r13+w] */
+    land8(o, to_done);
 }
 
 /* jcc rel32 to one of a div's out-of-line paths: the rel32's offset. */

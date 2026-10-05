@@ -534,6 +534,39 @@ static void test_flags_and_all_registers_faults(void)
     host_call_stack = 0;
 }
 
+/* A single movs, stos or lods with fault markers runs forwards as plain
+ * moves: one whose source or destination is in the null page stops at the
+ * string instruction with esi and edi as they were, the access refused and
+ * its address, direction and width reported. (The guarded mode leaves
+ * string instructions to the host, so only the marked one is checked.) */
+static void test_single_string_faults(void)
+{
+    /* mov esi, src; mov edi, dst; then the string instruction at +10 */
+    static const struct { uint8_t op[2]; size_t op_bytes; uint32_t src, dst, address; uint8_t write, width; } cases[] = {
+        { { 0xa5 }, 1, 0x10, 0, 0x10, 0, 4 },              /* movsd: the read faults */
+        { { 0xa4 }, 1, 0, 0x20, 0x20, 1, 1 },              /* movsb: the write faults */
+        { { 0x66, 0xab }, 2, 0, 0x30, 0x30, 1, 2 },        /* stosw */
+        { { 0xad }, 1, 0x40, 0, 0x40, 0, 4 },              /* lodsd */
+    };
+    for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const uint32_t src = cases[i].src ? cases[i].src : low + DATA, dst = cases[i].dst ? cases[i].dst : low + DATA + 0x100;
+        uint8_t code[16] = { 0xbe, 0, 0, 0, 0, 0xbf, 0, 0, 0, 0 };
+        Run marked;
+
+        memcpy(code + 1, &src, 4);
+        memcpy(code + 6, &dst, 4);
+        memcpy(code + 10, cases[i].op, cases[i].op_bytes);
+        code[10 + cases[i].op_bytes] = 0xc3;
+        marked = run(code, 11 + cases[i].op_bytes, 1);
+        if (marked.status != PW_ERR_VM || marked.state.eip != low + CODE + 10)
+            fprintf(stderr, "string %u: status %d eip +%x\n", i, marked.status, marked.state.eip - low - CODE);
+        assert(marked.status == PW_ERR_VM && marked.state.eip == low + CODE + 10 && marked.redirected == 1);
+        assert(marked.state.fault_address == cases[i].address && marked.state.fault_write == cases[i].write);
+        assert(marked.state.fault_width == cases[i].width);
+        assert(marked.state.gpr[6] == src && marked.state.gpr[7] == dst);
+    }
+}
+
 int main(void)
 {
     struct sigaction action;
@@ -583,6 +616,7 @@ int main(void)
     test_high_bytes_and_bit_strings();
     test_main_instruction_faults();
     test_flags_and_all_registers_faults();
+    test_single_string_faults();
     printf("fault markers passed: loads, stores, a locked read-modify-write, push and pop faulting "
            "on the null page report the guard's EIP, registers, flags and fault; every copied addressing "
            "and stack form matches the guard; the engine finds each access's path and nothing else; div's divisor load faults like any other, "

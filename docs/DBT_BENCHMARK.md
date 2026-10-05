@@ -1117,6 +1117,12 @@ latency on top of the guest's own.
   with `cmp`/`jne` instead of the flag-free five-instruction sequence when
   the code after the call sets every arithmetic flag before it reads any
   (`add esp, n`, `test eax, eax`), which is the usual case.
+- **Single string instructions.** Wine's msvcrt `memmove`, which DXVK and
+  d3dx9 call for every copy, aligns its destination with up to five single
+  `movs`. With fault markers and DF clear, a single `movs`, `stos` or
+  `lods` is now a load and/or store through `esi` and `edi`, listed in the
+  fault table like any other access, and `lea`s that step them; with DF set
+  it stays the host's instruction between the two `xchg rdi, r13`.
 
 On the PC (one core of an i7-12700H, loaded host, so only indicative), a
 loop dispatching an eight-way random switch went from 11.5 to 8.0 ns per
