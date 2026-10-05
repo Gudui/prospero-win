@@ -635,3 +635,40 @@ malformed images, guarded-read refusal and bounded recovery. These tests do
 not execute Wine, guest code, stubs, real signals or faults. The run-loop
 consumer, consistent module builds and complete console gates remain
 required. This transport performs no interception and claims no speed gain.
+
+### Pending guest context edits
+
+Patch 0893 supplies an explicit native observer for the gap before transaction
+context publication. A CPU thread can attach persistent, 16-byte aligned native
+storage. Attach, take and detach require that thread's held memory lease.
+There is no attachment or runtime activation in this dependency.
+
+Self Wow64 context updates record their explicit input after the ordinary
+native writes. Suspension replies record the guest field groups actually
+returned by the server. Recording copies FP bytes and retains no input-context
+pointer. Native host FP fixups do not count as guest FP edits. The storage
+remains attached across Unix/PE return boundaries until explicitly detached;
+a runtime consumer must retain it for the complete CPU thread lifetime.
+
+Taking pending edits starts with a complete snapshot of the current engine
+guest state and overlays only the guest field groups that an observer changed.
+A legacy x87 edit preserves SSE from that snapshot, or from a preceding explicit
+extended-register edit. A later extended-register edit replaces earlier legacy
+edits. A bare reset flag is acknowledged without inventing guest field changes.
+The completed canonical image is installed before clearing the pending fields
+and CPU reset flag. Active transaction publication must finish before take.
+
+XSTATE edits and a nested recorder conflict return INVALID without discarding
+pending storage or modifying canonical state. Detach refuses unconsumed edits.
+A consumer must resolve an INVALID result through a complete ordinary context
+handoff or stop; it must never resume stale guest state, reuse partial FP data,
+or retry a committed scalar operation. The ordinary handoff remains required
+before this path can be activated.
+
+`python3 tests/test_wine_sync_bop_pending.py` executes the actual native helper
+bodies with explicit benign contexts, FP conversion and OS authority mocks. It checks all 64
+field combinations, ordered extended/legacy FP updates, preservation of the
+native host FP frame, retained edits across return boundaries, lease/reset
+guards and nested-record refusal. Real Wine, signals, faults, guest execution
+and console speed are outside these fixture checks. Complete SDK modules and
+the actual CPU/run-loop consumer remain necessary for console validation.

@@ -418,6 +418,7 @@ if [ "$prx_status" = 0 ]; then
         __wine_ps5_sync_bop_backend \
         __wine_ps5_sync_bop_context_backend \
         __wine_ps5_sync_bop_memory_backend \
+        __wine_ps5_sync_bop_pending_backend \
         __wine_ps5_set_segv_hook __wine_ps5_set_segv_unresolved_hook pw_wine_set_display_release pw_wine_release_display
     python3 "$root/tools/gen_prx_descriptor.py" "$prx/obj/win32u_desc.c" __wine_unix_lib_init
     python3 "$root/tools/gen_prx_descriptor.py" "$prx/obj/wineserver_desc.c" \

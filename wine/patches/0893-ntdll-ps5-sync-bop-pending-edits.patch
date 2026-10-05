@@ -1,0 +1,271 @@
+From: Prospero Win contributors <prospero-win@localhost>
+Subject: [PATCH] ntdll: retain explicit guest edits before BOP publication
+
+Record only explicit Wow64 guest edits, independent of native host FP frames.
+Merge changed field groups with the current engine guest snapshot under the
+existing VM lease; preserve SSE on legacy x87 edits. No consumer activation.
+
+diff --git a/dlls/ntdll/unix/unix_private.h b/dlls/ntdll/unix/unix_private.h
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -124,10 +124,11 @@
+     LONGLONG     ps5_sleep_asked;   /* microseconds of sleep asked since then */
+     char         debug_info[0x800]; /* debug_info structure */
+ #if defined(__x86_64__) && (defined(__PROSPERO__) || defined(WINE_INPROCESS_SERVER))
+     void        *ps5_sync_bop_context; /* atomic native transaction view, normally NULL */
+     void        *ps5_sync_bop_memory; /* current-thread bounded VM lease, normally NULL */
++    void        *ps5_sync_bop_pending; /* explicitly attached CPU observer, normally NULL */
+ #endif
+     char         signal_stack[];    /* signal stack */
+     /* char kernel_stack[] */
+ };
+ 
+@@ -300,10 +301,11 @@
+ extern void *get_cpu_area( struct thread_data *data, USHORT machine );
+ #if defined(__x86_64__) && (defined(__PROSPERO__) || defined(WINE_INPROCESS_SERVER))
+ extern void *ps5_sync_bop_cpu_area( struct thread_data *data );
+ extern void ps5_sync_bop_context_edit( struct thread_data *data );
+ extern void ps5_sync_bop_context_resumed( struct thread_data *data, unsigned int flags );
++extern void ps5_sync_bop_pending_edit( struct thread_data *data, const I386_CONTEXT *context, unsigned int flags );
+ #endif
+ extern void set_thread_id( struct thread_data *data );
+ extern NTSTATUS init_thread_stack( TEB *teb, ULONG_PTR limit, SIZE_T reserve_size, SIZE_T commit_size );
+ extern void DECLSPEC_NORETURN abort_thread( int status );
+ extern void DECLSPEC_NORETURN abort_process( int status );
+diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -83,10 +83,12 @@
+ #include "wine/list.h"
+ #include "wine/asm.h"
+ #include "unix_private.h"
+ #if defined(__PROSPERO__) || defined(WINE_INPROCESS_SERVER)
+ #include "wine/ps5_sync_bop_context.h"
++#include "wine/ps5_sync_bop_memory.h"
++#include "wine/ps5_sync_bop_pending.h"
+ #endif
+ #include "wine/debug.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(unwind);
+ WINE_DECLARE_DEBUG_CHANNEL(seh);
+@@ -1047,10 +1049,151 @@
+     return status;
+ }
+ 
+ 
+ #if defined(__PROSPERO__) || defined(WINE_INPROCESS_SERVER)
++/* Pending edits are recorded only for an explicitly attached CPU thread.
++ * Native host FP fixups are not guest FP changes. Neither the recorder nor
++ * its copied FP data retains a pointer to a caller's context. */
++C_ASSERT( sizeof(((I386_CONTEXT *)0)->ExtendedRegisters) == 512 );
++C_ASSERT( sizeof(((I386_CONTEXT *)0)->FloatSave) == 112 );
++
++static int ps5_sync_bop_pending_held( struct thread_data *data )
++{
++    const struct pw_sync_bop_memory_view *lease = data->ps5_sync_bop_memory;
++    return lease && lease->state == PW_BOP_MEMORY_HELD && lease->locked &&
++           lease->owner == (UINT_PTR)data;
++}
++
++static int ps5_sync_bop_pending_attach( struct pw_sync_bop_pending_view *view, uint32_t context_size )
++{
++    struct thread_data *data = get_thread_data();
++    struct syscall_frame *frame;
++    WOW64_CPURESERVED *cpu;
++
++    if (!data || !data->teb || !view || ((UINT_PTR)view & 15) ||
++        view->version != PW_BOP_PENDING_VERSION || view->size != sizeof(*view) ||
++        context_size != sizeof(I386_CONTEXT) || !ps5_sync_bop_pending_held(data) ||
++        data->ps5_sync_bop_pending || data->ps5_sync_bop_context ||
++        !(frame = get_syscall_frame(data)) || frame->prev_frame ||
++        !view->canonical || (void *)(UINT_PTR)view->canonical != get_cpu_area(data,IMAGE_FILE_MACHINE_I386)) return 0;
++    cpu = data->teb->TlsSlots[WOW64_TLS_CPURESERVED];
++    if (cpu->Flags & WOW64_CPURESERVED_FLAG_RESET_STATE) return 0;
++    view->fields = 0;
++    view->owner = (UINT_PTR)data;
++    view->active = 1;
++    __atomic_store_n( &data->ps5_sync_bop_pending, view, __ATOMIC_RELEASE );
++    return 1;
++}
++
++void ps5_sync_bop_pending_edit( struct thread_data *data, const I386_CONTEXT *context, unsigned int flags )
++{
++    struct pw_sync_bop_pending_view *view;
++    uint32_t expected = 1;
++
++    if (!(view = __atomic_load_n(&data->ps5_sync_bop_pending,__ATOMIC_ACQUIRE))) return;
++    flags &= 0x7f;
++    if (!flags) return;
++    if (!__atomic_compare_exchange_n(&view->active,&expected,2,0,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))
++    {
++        __atomic_fetch_or(&view->fields,PW_BOP_PENDING_EDIT_CONFLICT,__ATOMIC_RELEASE);
++        return;
++    }
++    if (flags & (CONTEXT_I386_EXTENDED_REGISTERS & ~CONTEXT_i386))
++    {
++        memcpy( view->extended, context->ExtendedRegisters, sizeof(view->extended) );
++        /* A later complete FP image replaces earlier legacy-only edits. */
++        __atomic_fetch_and(&view->fields,~(CONTEXT_I386_FLOATING_POINT & ~CONTEXT_i386),__ATOMIC_RELEASE);
++        flags &= ~(CONTEXT_I386_FLOATING_POINT & ~CONTEXT_i386);
++    }
++    else if (flags & (CONTEXT_I386_FLOATING_POINT & ~CONTEXT_i386))
++        memcpy( view->legacy, &context->FloatSave, sizeof(view->legacy) );
++    __atomic_fetch_or(&view->fields,flags,__ATOMIC_RELEASE);
++    __atomic_store_n(&view->active,1,__ATOMIC_RELEASE);
++}
++
++static uint32_t ps5_sync_bop_pending_take( struct pw_sync_bop_pending_view *view,
++                                          const void *fallback, uint32_t context_size )
++{
++    struct thread_data *data = get_thread_data();
++    WOW64_CPURESERVED *cpu;
++    I386_CONTEXT *canonical, prior, *result;
++    DECLSPEC_ALIGN(16) BYTE buffer[sizeof(I386_CONTEXT) + 16];
++    uint32_t fields;
++
++    if (!data || !data->teb || !view || !fallback || context_size != sizeof(I386_CONTEXT) ||
++        view->version != PW_BOP_PENDING_VERSION || view->size != sizeof(*view) ||
++        view->owner != (UINT_PTR)data || view->active != 1 ||
++        __atomic_load_n(&data->ps5_sync_bop_pending,__ATOMIC_ACQUIRE) != view ||
++        data->ps5_sync_bop_context || !ps5_sync_bop_pending_held(data) ||
++        (void *)(UINT_PTR)view->canonical != get_cpu_area(data,IMAGE_FILE_MACHINE_I386)) return PW_BOP_PENDING_INVALID;
++    cpu = data->teb->TlsSlots[WOW64_TLS_CPURESERVED];
++    fields = view->fields;
++    if (!fields && !(cpu->Flags & WOW64_CPURESERVED_FLAG_RESET_STATE)) return PW_BOP_PENDING_UNCHANGED;
++    /* XSTATE needs the ordinary native frame contract, not a 716-byte copy. */
++    if (fields & (PW_BOP_PENDING_EDIT_CONFLICT | (CONTEXT_I386_XSTATE & ~CONTEXT_i386))) return PW_BOP_PENDING_INVALID;
++    canonical = (I386_CONTEXT *)(UINT_PTR)view->canonical;
++    prior = *canonical;
++    result = (I386_CONTEXT *)(buffer + ((16 - offsetof(I386_CONTEXT,ExtendedRegisters) % 16) % 16));
++    memcpy( result, fallback, sizeof(*result) );
++    if (fields & (CONTEXT_I386_INTEGER & ~CONTEXT_i386))
++    {
++        result->Eax = prior.Eax; result->Ebx = prior.Ebx; result->Ecx = prior.Ecx;
++        result->Edx = prior.Edx; result->Esi = prior.Esi; result->Edi = prior.Edi;
++    }
++    if (fields & (CONTEXT_I386_CONTROL & ~CONTEXT_i386))
++    {
++        result->Eip = prior.Eip; result->Esp = prior.Esp; result->Ebp = prior.Ebp;
++        result->EFlags = prior.EFlags; result->SegCs = prior.SegCs; result->SegSs = prior.SegSs;
++    }
++    if (fields & (CONTEXT_I386_SEGMENTS & ~CONTEXT_i386))
++    {
++        result->SegDs = prior.SegDs; result->SegEs = prior.SegEs;
++        result->SegFs = prior.SegFs; result->SegGs = prior.SegGs;
++    }
++    if (fields & (CONTEXT_I386_DEBUG_REGISTERS & ~CONTEXT_i386))
++    {
++        result->Dr0 = prior.Dr0; result->Dr1 = prior.Dr1; result->Dr2 = prior.Dr2;
++        result->Dr3 = prior.Dr3; result->Dr6 = prior.Dr6; result->Dr7 = prior.Dr7;
++    }
++    if (fields & (CONTEXT_I386_EXTENDED_REGISTERS & ~CONTEXT_i386))
++        memcpy( result->ExtendedRegisters, view->extended, sizeof(view->extended) );
++    if (fields & (CONTEXT_I386_FLOATING_POINT & ~CONTEXT_i386))
++        fpu_to_fpux( (XSAVE_FORMAT *)result->ExtendedRegisters, (const I386_FLOATING_SAVE_AREA *)view->legacy );
++    fpux_to_fpu( &result->FloatSave, (const XSAVE_FORMAT *)result->ExtendedRegisters );
++    result->ContextFlags |= CONTEXT_I386_FULL | CONTEXT_I386_FLOATING_POINT | CONTEXT_I386_EXTENDED_REGISTERS;
++    memcpy( canonical, result, sizeof(*canonical) );
++    view->fields = 0;
++    cpu->Flags &= ~WOW64_CPURESERVED_FLAG_RESET_STATE;
++    return PW_BOP_PENDING_REPLACED;
++}
++
++static int ps5_sync_bop_pending_detach( struct pw_sync_bop_pending_view *view )
++{
++    struct thread_data *data = get_thread_data();
++    WOW64_CPURESERVED *cpu;
++
++    if (!data || !data->teb || !view || !view->active || view->owner != (UINT_PTR)data ||
++        __atomic_load_n(&data->ps5_sync_bop_pending,__ATOMIC_ACQUIRE) != view ||
++        !ps5_sync_bop_pending_held(data) || data->ps5_sync_bop_context) return 0;
++    cpu = data->teb->TlsSlots[WOW64_TLS_CPURESERVED];
++    if (view->fields || (cpu->Flags & WOW64_CPURESERVED_FLAG_RESET_STATE)) return 0;
++    __atomic_store_n( &data->ps5_sync_bop_pending, NULL, __ATOMIC_RELEASE );
++    view->active = 0; view->owner = 0;
++    return 1;
++}
++
++DECLSPEC_EXPORT const struct pw_sync_bop_pending_backend *__wine_ps5_sync_bop_pending_backend(uint32_t version)
++{
++    static const struct pw_sync_bop_pending_backend api =
++    {
++        PW_BOP_PENDING_VERSION, sizeof(api), sizeof(void *), sizeof(struct pw_sync_bop_pending_view),
++        ps5_sync_bop_pending_attach, ps5_sync_bop_pending_take, ps5_sync_bop_pending_detach
++    };
++    return version == PW_BOP_PENDING_VERSION ? &api : NULL;
++}
++
+ /* Pointer publication keeps readers off a partially copied I386 context.
+  * The caller and signal handlers execute on this thread; server observers
+  * reach the same view through the existing suspension protocol. */
+ void *ps5_sync_bop_cpu_area( struct thread_data *data )
+ {
+@@ -1555,10 +1698,13 @@
+             frame->xstate.CompactionMask |= xstate_extended_features;
+         copy_xstate( &frame->xstate, xs, xs->Mask );
+         if (xs->CompactionMask) frame->xstate.Mask |= mask & ~xs->CompactionMask;
+         frame->restore_flags |= CONTEXT_XSTATE;
+     }
++#if defined(__PROSPERO__) || defined(WINE_INPROCESS_SERVER)
++    ps5_sync_bop_pending_edit( data, context, flags );
++#endif
+     return STATUS_SUCCESS;
+ }
+ 
+ 
+ /***********************************************************************
+diff --git a/dlls/ntdll/unix/thread.c b/dlls/ntdll/unix/thread.c
+--- a/dlls/ntdll/unix/thread.c
++++ b/dlls/ntdll/unix/thread.c
+@@ -1107,10 +1107,22 @@
+             ps5_sync_bop_context_edit( get_thread_data() );
+ #endif
+             context_from_server( wow_context, &server_contexts[1], main_image_info.Machine );
+ #if defined(__x86_64__) && (defined(__PROSPERO__) || defined(WINE_INPROCESS_SERVER))
+             ps5_sync_bop_context_resumed( get_thread_data(), server_contexts[1].flags );
++            if (main_image_info.Machine == IMAGE_FILE_MACHINE_I386)
++            {
++                unsigned int flags = 0;
++                if (server_contexts[1].flags & SERVER_CTX_CONTROL) flags |= CONTEXT_I386_CONTROL;
++                if (server_contexts[1].flags & SERVER_CTX_INTEGER) flags |= CONTEXT_I386_INTEGER;
++                if (server_contexts[1].flags & SERVER_CTX_SEGMENTS) flags |= CONTEXT_I386_SEGMENTS;
++                if (server_contexts[1].flags & SERVER_CTX_DEBUG_REGISTERS) flags |= CONTEXT_I386_DEBUG_REGISTERS;
++                if (server_contexts[1].flags & SERVER_CTX_EXTENDED_REGISTERS) flags |= CONTEXT_I386_EXTENDED_REGISTERS;
++                else if (server_contexts[1].flags & SERVER_CTX_FLOATING_POINT) flags |= CONTEXT_I386_FLOATING_POINT;
++                if (server_contexts[1].flags & SERVER_CTX_YMM_REGISTERS) flags |= CONTEXT_I386_XSTATE;
++                ps5_sync_bop_pending_edit( get_thread_data(), wow_context, flags );
++            }
+ #endif
+         }
+         else
+             context_from_server( native_context, &server_contexts[1], native_machine );
+     }
+diff --git a/include/wine/ps5_sync_bop_pending.h b/include/wine/ps5_sync_bop_pending.h
+--- a/include/wine/ps5_sync_bop_pending.h
++++ b/include/wine/ps5_sync_bop_pending.h
+@@ -0,0 +1,25 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#ifndef WINE_PS5_SYNC_BOP_PENDING_H
++#define WINE_PS5_SYNC_BOP_PENDING_H
++#include <stdint.h>
++#define PW_BOP_PENDING_VERSION 1u
++#define PW_BOP_PENDING_UNCHANGED 0u
++#define PW_BOP_PENDING_REPLACED 1u
++#define PW_BOP_PENDING_INVALID 2u
++#define PW_BOP_PENDING_EDIT_CONFLICT 0x80000000u
++/* Persistent, native, 16-byte aligned storage. A VM lease guards attach,
++ * take and detach. Explicit guest edits survive Unix/PE return boundaries. */
++struct pw_sync_bop_pending_view
++{
++    uint32_t version, size, fields, active;
++    uint64_t canonical, owner;
++    uint8_t extended[512], legacy[112];
++};
++struct pw_sync_bop_pending_backend
++{
++    uint32_t version, size, pointer_size, view_size;
++    int (*attach)(struct pw_sync_bop_pending_view *, uint32_t);
++    uint32_t (*take)(struct pw_sync_bop_pending_view *, const void *, uint32_t);
++    int (*detach)(struct pw_sync_bop_pending_view *);
++};
++#endif
