@@ -22,9 +22,9 @@ FreeBSD headers, so Wine selects its FreeBSD paths (kqueue instead of epoll,
 sysctl), and `__PROSPERO__` selects the PS5 patches. PE modules come from
 the host build that `tools/build_wine_runtime.sh` produces, which also
 supplies winebuild and widl. The exception is the few PE modules a patch
-changes (`PE_MODULES`, today the xinput DLLs), which are built from the
-patched tree for i386 and x86_64 into `.deps/wine-ps5/pe`. That needs both
-MinGW cross compilers.
+changes (`PE_MODULES`: the xinput DLLs, quartz, opengl32 and user32), which
+are built from the patched tree for i386 and x86_64 into
+`.deps/wine-ps5/pe`. That needs both MinGW cross compilers.
 
 ~~~sh
 tools/build_wine_ps5.sh --check-patches   # validate and print the series
@@ -98,6 +98,7 @@ before evaluating a candidate built from that cache.
 | 0610 | `ntdll`: `__wine_ps5_set_segv_hook` lets `wowprospero` resume its own faults (fault markers) from inside Wine's SIGSEGV handler, instead of a second handler chaining to the action `sigaction` reports |
 | 0770 | `server`, `ntdll`: on PS5, the client thread runs sync-object and handle requests itself under a server lock instead of waking the server thread twice through the pipes; see [Sync requests on the client threads](#sync-requests-on-the-client-threads) |
 | 0790 | `server`, `ntdll`: opt-in immediate mutex acquire/release using the authoritative server object without request marshalling or waiter allocation; see [Immediate mutex calls](#immediate-mutex-calls) |
+| 0800 | `server`, `user32`: opt-in candidate; the server publishes each initialized window's style in a separate fixed section, so `GetWindowLong(GWL_STYLE)`, `IsIconic` and `IsZoomed` read it in user32 instead of making a system call; see [Window style without a system call](#window-style-without-a-system-call) |
 
 ## Allocator
 
@@ -365,6 +366,65 @@ startup/timedemo, the fixed city route, load and 30-minute stability gates.
 The target remains the complete 1080p/60 Hz city route at average at least
 58 FPS and minimum at least 50 FPS, with profiling off and the accepted
 regressions preserved. No speed gain or merge acceptance is claimed here.
+
+### Window style without a system call
+
+Patch 0800 is an opt-in candidate for `GetWindowLongA/W(GWL_STYLE)`,
+`IsIconic` and `IsZoomed`. Historical profiling identified frequent style
+queries; the console saving on the current accepted stack remains unmeasured.
+
+The authoritative server publishes each window's style in the independent
+`\KernelObjects\__wine_window_styles` section. Its fixed layout has a
+32-byte versioned header and 32-byte records covering every user handle;
+the 1,047,840-byte table rounds to 1 MiB on the console. The section is created
+only when publication is enabled. The table never grows. user32 maps it
+read-only and validates magic, version, record size and count.
+
+Publication starts only after `init_window_info`. user32 answers only for
+windows owned by its process, with matching handle generation and publication
+tag. All authoritative style changes update the record under the existing
+server lock. Both handle-free paths and owner-thread detachment retire it
+before releasing the handle or owner. Creation, other processes, invalid or
+retired handles, busy publication and mapping failures retain the ordinary
+win32u path. Other offsets are unchanged. Readers try at most 16 sequence
+observations. Mapping reservations use a monotonic atomic counter: at most
+eight attempts per loaded user32 instance, including concurrent or failed
+attempts. One published view stays mapped for the module's process lifetime;
+concurrent losing views are unmapped. Optional allocation failures preserve
+ordinary startup error state and leave queries on the ordinary path.
+
+Publication defaults OFF. Set `WINE_PS5_WINDOW_STYLE_SHARED=1`, or write exactly
+`1` or `1\n` to `pw_window_style_shared` in the prefix, to enable it. An
+explicit environment setting takes precedence; all values except exact `1`
+select OFF. Missing, malformed or unreadable prefix settings select OFF.
+Selection is cached under the server lock and logs
+`wine-ps5: shared window-style queries: on|off`; restart the runtime when
+changing the selection. No descriptor remains open after selection.
+
+Wine protocol 961, `window_shm_t`, ntdll and win32u remain unchanged. Deploy
+the matching candidate `wineserver.prx` and both `user32.dll` architectures;
+retain the accepted win32u/graphics binary. The independent section version
+checks this publication format. The earlier protocol-962 prototype is
+superseded and must not be mixed into this bundle.
+
+`python3 tests/test_wine_window_style.py` compiles actual reader, reservation,
+authority, selector, namespace initialization and mapping bodies with explicit
+native mocks. It checks legal style values, creation, own-process and generation
+misses, aliases, retire/reuse/detach, bounded busy fallback, malformed section
+headers, concurrent reservations and mocked allocation/I/O failure. Native
+checks do not establish the real module ABI or console UI semantics.
+`tests/wine_window_style_check.c` is the separate ordinary PE console fixture:
+both architectures, OFF and ON, compare user32 with direct win32u queries,
+including error state, ordinary style changes, creation callbacks and thread
+ownership. It uses 32 windows, bounded thread waits and an optional small
+`--bench` workload; it does not stress console allocation limits.
+
+Component validation requires a complete control-reproducing SDK/PE pair,
+ordinary UI and HL2/clean Wine-exit gates, matched profiling-OFF 1080p/60 Hz
+city A/B 480-second runs, load and 600-second stability. Report the complete
+200–440-second average and minimum sampled FPS. The project goal remains
+58/50 FPS on that window; accepting an individual improvement does not meet
+that goal. Source/native checks alone do not establish a speedup or merge gate.
 
 ## User driver
 
