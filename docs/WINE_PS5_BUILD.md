@@ -408,10 +408,12 @@ including error state, ordinary style changes, creation callbacks and thread
 ownership. It uses 32 windows, bounded thread waits and an optional small
 `--bench` workload; it does not stress console allocation limits.
 
-Acceptance requires a complete control-reproducing SDK/PE pair, ordinary UI
-and HL2/clean Wine-exit gates, matched profiling-OFF 1080p/60 Hz city A/B
-480-second runs, the full 200–440-second 58/50 FPS target, load and 600-second
-stability. Source/native checks alone do not establish a speedup or merge gate.
+Component validation requires a complete control-reproducing SDK/PE pair,
+ordinary UI and HL2/clean Wine-exit gates, matched profiling-OFF 1080p/60 Hz
+city A/B 480-second runs, load and 600-second stability. Report the complete
+200–440-second average and minimum sampled FPS. The project goal remains
+58/50 FPS on that window; accepting an individual improvement does not meet
+that goal. Source/native checks alone do not establish a speedup or merge gate.
 
 ## User driver
 
