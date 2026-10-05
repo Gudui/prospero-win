@@ -38,6 +38,14 @@ latest code, build the pieces and put them together with
 To update, replace the whole `PPSA99995` folder. Your games and settings live
 in `/data/prospero-win` and are kept.
 
+The console only starts the app if `eboot.bin` and every `.prx` module have
+execute permission. The folder in the zip has them, but some FTP servers
+(zftpd, for example) create every uploaded file without it. If the tile shows
+a launch error and goes back to Home at once, set the permission from your
+FTP client (a `SITE CHMOD 755` command, or the file's permission dialog) on
+`eboot.bin`, `sce_module/libc.prx` and the `.prx` files under
+`win/wine/lib/wine/x86_64-unix/`, then launch again.
+
 ## 2. Open it once
 
 Start prospero-win from the home screen. You should see its launcher, a
@@ -91,6 +99,11 @@ Saves and settings stay in the game's prefix on the PS5.
   the most useful thing to attach to an issue.
 - **Black screen with sound.** The game is probably drawing in a way the app
   can't show yet. Please open an issue with the game and its version.
+- **A launch error from the home screen, before any splash.** The console
+  refused to start the app at all, which no log can show. Most often the
+  files lack execute permission after an FTP upload: see
+  [installing](#1-install-the-app). A kernel log (the klogsrv payload) names
+  the refused file.
 - **No games in the launcher.** Check that `profiles/profiles.lst` lists your
   profile's file name, and that the profile's `prefix =` matches the folder
   under `prefixes/`. Check that elfldr is listening on port 9021 and that the

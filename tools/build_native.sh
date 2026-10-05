@@ -198,6 +198,11 @@ objects+=("$build/obj/ps5log.o" "$build/obj/ps5log_ps5_net.o")
 cp "$root/sce_sys/param.json" "$root/sce_sys/icon0.png" "$dist/sce_sys/"
 cp "$foundation/runtime/libc.prx" "$dist/sce_module/libc.prx"
 cp "$lapy_helper_elf" "$dist/lapy.elf"
+# The console refuses to start a title whose eboot lacks execute permission
+# (exec fails with EACCES) and its loader refuses a PRX without it ("mount
+# flag / attribute error"), so mark both here. An FTP upload may still reset
+# the modes; docs/GETTING_STARTED.md says what to do then.
+chmod 755 "$dist/eboot.bin" "$dist/sce_module/libc.prx"
 if [[ -f $dev_conf ]]; then
     cp "$dev_conf" "$dist/dev.conf"
 fi

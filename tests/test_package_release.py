@@ -68,6 +68,13 @@ def main() -> int:
             ["libvulkan.prx", "ntdll.prx", "win32u.prx"]
         assert (share / "nls" / "locale.nls").exists() and (share / "fonts" / "tahoma.ttf").exists()
         assert "PPSA99995: 16 files" in result.stdout, result.stdout
+        # The console refuses to exec an eboot or load a PRX without execute
+        # permission, whatever mode the inputs had; data files stay as they were.
+        for name in ("eboot.bin", "sce_module/libc.prx", "win/wine/lib/wine/x86_64-unix/ntdll.prx",
+                     "win/wine/lib/wine/x86_64-unix/libvulkan.prx"):
+            assert (app / name).stat().st_mode & 0o777 == 0o755, name
+        assert not (app / "sce_sys" / "param.json").stat().st_mode & 0o111
+        assert not (lib / "x86_64-windows" / "wowprospero.dll").stat().st_mode & 0o111
 
         # A second run replaces the folder rather than merging into it.
         write(app / "stale.txt")
@@ -83,7 +90,7 @@ def main() -> int:
                   "--cpu-dll", str(root / "missing.dll"), "--out", str(out))
         assert bad.returncode == 2 and "--cpu-dll" in bad.stderr
     print("package release passed: layout, dev.conf and PC-only modules left out, patched xinput, "
-          "a clean folder each time, missing inputs named")
+          "eboot and PRX modules executable, a clean folder each time, missing inputs named")
     return 0
 
 

@@ -144,6 +144,9 @@ It writes `release/PPSA99995/` (about 350 MB) and, with `--zip`,
 PC, is left out; a player adds their own to get a log. Wine's PE modules are
 the host build's, less import libraries and the drivers that need the PC's
 own libraries (X11, GStreamer, pcap, scanners).
+`eboot.bin` and every `.prx` are marked executable: the console refuses to
+exec an eboot, or to load a module, without that permission, and the zip
+keeps the modes.
 
 ## Making a release
 

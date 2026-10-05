@@ -82,6 +82,10 @@ cp "$cpu_dll" "$lib/x86_64-windows/wowprospero.dll"
 cp "$wine_ps5"/prx/sce_module/*.prx "$lib/x86_64-unix/"
 cp "$host_wine"/share/wine/nls/* "$share/nls/"
 cp "$wine_ps5"/prx/fonts/* "$share/fonts/"
+# The PS5 kernel refuses to exec an eboot without execute permission and its
+# loader refuses a PRX without it, so every executable module is 0755.
+chmod 755 "$app/eboot.bin"
+find "$app" -type f -name '*.prx' -exec chmod 755 {} +
 
 files=$(find "$app" -type f | wc -l)
 size=$(du -sh "$app" | cut -f1)
