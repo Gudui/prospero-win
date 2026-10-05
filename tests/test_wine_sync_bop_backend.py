@@ -22,9 +22,9 @@ def main():
     mutex = ROOT / "wine/patches/0820-ntdll-ps5-shared-mutex-client.patch"
     sync = ROOT / "wine/patches/0887-ntdll-ps5-shared-sync-client.patch"
     source = new_side(PATCH, "dlls/ntdll/unix/server.c")
-    functions = ["static unsigned int server_try_shared_mutex_cached(",
+    functions = ["static inline __attribute__((always_inline)) unsigned int server_try_shared_mutex_cached(",
                  "static unsigned int server_try_shared_mutex(",
-                 "static unsigned int server_try_shared_sync_cached(",
+                 "static inline __attribute__((always_inline)) unsigned int server_try_shared_sync_cached(",
                  "static unsigned int server_try_shared_sync_inprocess(",
                  "static int try_cached_sync_bop(",
                  "DECLSPEC_EXPORT const struct pw_sync_bop_backend *__wine_ps5_sync_bop_backend("]
@@ -41,6 +41,9 @@ def main():
     actual_sync = body(source, functions[2]).replace("server_try_shared_sync_cached(",
                                                    "server_try_shared_sync_inprocess(")
     actual_sync = actual_sync.replace("unsigned int *previous, int allow_fill)", "unsigned int *previous)")
+    declaration = "static inline __attribute__((always_inline)) unsigned int"
+    actual_mutex = actual_mutex.replace(declaration, "static unsigned int")
+    actual_sync = actual_sync.replace(declaration, "static unsigned int")
     gate = "        if (!allow_fill) return STATUS_NOT_IMPLEMENTED;\n"
     assert actual_mutex.count(gate) == actual_sync.count(gate) == 1
     assert actual_mutex.replace(gate, "") == original_mutex

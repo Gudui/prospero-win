@@ -111,7 +111,7 @@ diff --git a/dlls/ntdll/unix/server.c b/dlls/ntdll/unix/server.c
   * path preserves guest waits/errors; all outputs to it happen after CAS. */
 -static unsigned int server_try_shared_mutex( HANDLE handle, int release,
 -                                             const LARGE_INTEGER *timeout, LONG *prev_count )
-+static unsigned int server_try_shared_mutex_cached( HANDLE handle, int release,
++static inline __attribute__((always_inline)) unsigned int server_try_shared_mutex_cached( HANDLE handle, int release,
 +                                             const LARGE_INTEGER *timeout, LONG *prev_count, int allow_fill )
  {
      struct thread_data *data = get_thread_data();
@@ -210,7 +210,7 @@ diff --git a/dlls/ntdll/unix/server.c b/dlls/ntdll/unix/server.c
 
 -static unsigned int server_try_shared_sync_inprocess(HANDLE handle, unsigned int operation, unsigned int count,
 -                                    const LARGE_INTEGER *timeout, unsigned int *previous)
-+static unsigned int server_try_shared_sync_cached(HANDLE handle, unsigned int operation, unsigned int count,
++static inline __attribute__((always_inline)) unsigned int server_try_shared_sync_cached(HANDLE handle, unsigned int operation, unsigned int count,
 +                                    const LARGE_INTEGER *timeout, unsigned int *previous, int allow_fill)
  {
      struct thread_data *data = get_thread_data();
