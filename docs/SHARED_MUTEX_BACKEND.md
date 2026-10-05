@@ -84,10 +84,14 @@ slots. Cache fills and all four existing close invalidations use
 `fd_cache_mutex`. Cell and page storage remains addressable through teardown;
 retired cells cannot be rebound to a new handle.
 
-The independent `WINE_PS5_SYNC_SHARED=1` or prefix-local `pw_sync_shared`
-containing exactly `1` with an optional newline enables discovery. Explicit
-environment settings win; absent, malformed and unreadable settings stay
-off. The shared and typed mutex selections and their existing ABI remain
+The independent `WINE_PS5_SYNC_SHARED` or prefix-local `pw_sync_shared`
+selects discovery. Patch 0888 proposes enabling it when the file is absent
+in an existing prefix directory. Exact `1` with an optional newline in the
+file, or environment value `1`, explicitly enables it; `0` disables it.
+Explicit environment settings win. Malformed or unreadable settings,
+allocation failure, and null, empty or nonexistent prefix directories stay
+off. The default-on proposal changes selection only and requires its own
+console gate before deployment. The shared and typed mutex selections and their existing ABI remain
 unchanged. Disabling direct server calls prevents discovery. Non-in-process
 builds return ordinary fallback from the same client entry point.
 
@@ -118,11 +122,21 @@ The console owner reports the bounded matching pair (server `3cfaa720`,
 ntdll `ddc5bc0e`) passed the ordinary 32-bit sync fixture with the switch
 off and on: 12 cases, 330 checks, zero failures and Wine-exit in each arm.
 HL2 measured 59.38 FPS with Wine-exit in both arms on the same console.
-The reported 480-second city comparisons were 52.3/45.4 FPS (mean/minimum)
-with the switch on, 50.8/46.5 off, and 53.0/47.2 on again. Verification of
-the matching 200–440-second window and the 600-second stability gate is
-pending. These reports do not establish the full 58/50 FPS target or an
-accepted event/semaphore gain; selection remains default off.
+Independent complete live-stream audits confirm the matching 200–440-second
+window: 158 samples at 52.34/45.42 FPS (mean/minimum) with the switch on,
+158 at 50.76/46.45 off, and 159 at 53.02/47.21 on again. The average of the
+two ON means is about 1.92 FPS above the single OFF mean; this small series
+does not establish statistical significance or every asynchronous contract.
+The owner confirmed the same bounded pair with sync ON passed the 600-second
+gate (raw `20261005T003141877Z`): the complete stream spans 605.02 seconds,
+with 159 samples at 52.99/45.97 FPS in the same window and 92 at 52.26/49.67
+in 460–600 seconds. Its load proxy is 94.67 seconds, with no recorded fault
+or file-limit error; the clean transport ends by `close-timeout`, which is
+not Wine-exit. These are equal-weight approximate FPS samples, not
+frame-time-weighted FPS or instantaneous minima. The full 58/50 target is
+still unmet. The previously accepted selection was default off; the separate
+0888 default-on proposal still needs its ordinary PE, HL2, load and
+600-second city gate on the exact new module before runtime acceptance.
 
 `tools/build_wine_sync_ordinary.py --out <artifact-directory>` compiles a
 bounded x86 PE32 console program using the public MinGW compiler. It imports

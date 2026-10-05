@@ -3,13 +3,16 @@
 #define _GNU_SOURCE
 #include "ps5_sync_backend.h"
 #include <assert.h>
+#include <errno.h>
 #include <pthread.h>
 #include <sched.h>
 #include <stdatomic.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #define WINE_INPROCESS_SERVER 1
 #define STATUS_SUCCESS 0u
 #define STATUS_NOT_IMPLEMENTED 0xc0000002u
@@ -94,7 +97,20 @@ static int ps5_get_semaphore_word(struct thread *t,struct object *o,struct pw_sy
 static const struct pw_sync_backend *shared_sync_backend;
 #include "shared_sync_client.inc"
 static const char *config_dir;
+static int switch_open_error, switch_allocate_error;
+static FILE *switch_fopen(const char *path, const char *mode) {
+    if (switch_open_error) { errno=switch_open_error; return NULL; }
+    return fopen(path,mode);
+}
+static int switch_asprintf(char **path, const char *format, ...) {
+    if (switch_allocate_error) { errno=ENOMEM; return -1; }
+    va_list args; va_start(args,format); int result=vasprintf(path,format,args); va_end(args); return result;
+}
+#define fopen switch_fopen
+#define asprintf switch_asprintf
 #include "shared_sync_switch.inc"
+#undef asprintf
+#undef fopen
 
 static void write_switch(const char *value) {
     char *path; assert(asprintf(&path,"%s/pw_sync_shared",config_dir)>0);
@@ -102,17 +118,39 @@ static void write_switch(const char *value) {
 }
 static void test_switch(void) {
     const char *values[]={"","0","1","1\n","11","1\nextra","on","1\r\n"};
-    assert(!unsetenv("WINE_PS5_SYNC_SHARED") && !server_shared_sync_enabled());
-    assert(!setenv("WINE_PS5_MUTEX_SHARED","1",1) && !server_shared_sync_enabled());
+    assert(!unsetenv("WINE_PS5_SYNC_SHARED") && server_shared_sync_enabled()==PW_TEST_SYNC_DEFAULT_ON);
+    assert(!setenv("WINE_PS5_MUTEX_SHARED","1",1) && server_shared_sync_enabled()==PW_TEST_SYNC_DEFAULT_ON);
+    assert(!setenv("WINE_PS5_MUTEX_FAST","1",1) && server_shared_sync_enabled()==PW_TEST_SYNC_DEFAULT_ON);
     for (unsigned i=0;i<8;i++) {
         write_switch(values[i]); assert(server_shared_sync_enabled()==(i==2 || i==3));
         assert(!setenv("WINE_PS5_SYNC_SHARED","0",1) && !server_shared_sync_enabled());
         assert(!setenv("WINE_PS5_SYNC_SHARED","1",1) && server_shared_sync_enabled());
         assert(!setenv("WINE_PS5_SYNC_SHARED","on",1) && !server_shared_sync_enabled());
+        assert(!setenv("WINE_PS5_SYNC_SHARED","",1) && !server_shared_sync_enabled());
+        assert(!setenv("WINE_PS5_SYNC_SHARED","1\n",1) && !server_shared_sync_enabled());
         assert(!unsetenv("WINE_PS5_SYNC_SHARED"));
     }
-    char *path; assert(asprintf(&path,"%s/pw_sync_shared",config_dir)>0); assert(!remove(path)); free(path);
-    assert(!unsetenv("WINE_PS5_MUTEX_SHARED") && !server_shared_sync_enabled());
+    char *path; assert(asprintf(&path,"%s/pw_sync_shared",config_dir)>0); assert(!remove(path));
+    assert(!unsetenv("WINE_PS5_MUTEX_SHARED") && server_shared_sync_enabled()==PW_TEST_SYNC_DEFAULT_ON);
+    assert(!unsetenv("WINE_PS5_MUTEX_FAST"));
+    switch_open_error=EACCES; assert(!server_shared_sync_enabled()); switch_open_error=0;
+    switch_allocate_error=1; assert(!server_shared_sync_enabled());
+    assert(!setenv("WINE_PS5_SYNC_SHARED","1",1) && server_shared_sync_enabled());
+    assert(!unsetenv("WINE_PS5_SYNC_SHARED")); switch_allocate_error=0;
+    assert(!mkdir(path,0700) && !server_shared_sync_enabled()); assert(!remove(path));
+    const char *valid_prefix=config_dir;
+    char *missing; assert(asprintf(&missing,"%s/missing-prefix",valid_prefix)>0);
+    config_dir=missing; assert(!server_shared_sync_enabled()); config_dir=valid_prefix; free(missing);
+#if PW_TEST_SYNC_DEFAULT_ON
+    config_dir=NULL; assert(!server_shared_sync_enabled());
+    assert(!setenv("WINE_PS5_SYNC_SHARED","1",1) && server_shared_sync_enabled());
+    assert(!unsetenv("WINE_PS5_SYNC_SHARED"));
+    config_dir=""; assert(!server_shared_sync_enabled()); config_dir=valid_prefix;
+#endif
+    write_switch("1"); config_dir=path; assert(!server_shared_sync_enabled());
+    config_dir=valid_prefix; assert(!remove(path)); free(path);
+    printf("PASS: sync selection default %s, strict overrides, read/allocation failure and invalid prefix fallback\n",
+           PW_TEST_SYNC_DEFAULT_ON ? "on" : "off");
 }
 static struct node *node(unsigned handle,unsigned kind,unsigned initial,unsigned max,unsigned access,int eligible) {
     assert(node_count<200); struct node *n=&nodes[node_count++];

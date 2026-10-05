@@ -12,6 +12,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 PATCH = ROOT / "wine/patches/0887-ntdll-ps5-shared-sync-client.patch"
+DEFAULTS = ROOT / "wine/patches/0888-ntdll-ps5-shared-sync-default-on.patch"
 
 
 def additions(patch, file):
@@ -21,11 +22,15 @@ def additions(patch, file):
                      if line.startswith("+") and not line.startswith("+++")) + "\n"
 
 
-def new_side(patch, file):
+def side(patch, file, signs):
     part = next(part for part in patch.read_text().split("diff --git ")[1:]
                 if part.splitlines()[0].endswith(" b/" + file))
-    return "\n".join(line[1:] for line in part.splitlines()
-                     if line.startswith(("+", " ")) and not line.startswith("+++")) + "\n"
+    return "\n".join(line[1:] if line else "" for line in part.splitlines()
+                     if (not line or line.startswith(signs)) and not line.startswith(("+++", "---"))) + "\n"
+
+
+def new_side(patch, file):
+    return side(patch, file, ("+", " "))
 
 
 def body(source, signature):
@@ -45,6 +50,11 @@ def main():
     cache = client[start:client.index("\n#endif", start)]
     wrapper = body(client, "unsigned int server_try_shared_sync(")
     switch = body(client, "static int server_shared_sync_enabled(")
+    before = body(side(DEFAULTS, "dlls/ntdll/unix/server.c", ("-", " ")),
+                  "static int server_shared_sync_enabled(")
+    assert before == switch, "default selection patch must start at the actual opt-in switch"
+    default_switch = body(new_side(DEFAULTS, "dlls/ntdll/unix/server.c"),
+                          "static int server_shared_sync_enabled(")
     server = new_side(PATCH, "server/request.c")
     assert "server_clear_shared_sync_slot(handle);" in client
     # The existing mutex clear is reached at all four actual close/cache sites.
@@ -67,16 +77,18 @@ def main():
             ROOT / "wine/patches/0885-server-ps5-shared-sync-word.patch", "include/wine/ps5_sync_word.h"))
         (folder / "ps5_sync_backend.h").write_text(additions(PATCH, "include/wine/ps5_sync_backend.h"))
         (folder / "shared_sync_client.inc").write_text(cache + "\n" + wrapper)
-        (folder / "shared_sync_switch.inc").write_text(switch)
         (folder / "shared_sync_server_abi.inc").write_text(
             body(server, "static int get_shared_sync_word(") +
             body(server, "DECLSPEC_EXPORT const struct pw_sync_backend *pw_wineserver_sync_backend("))
         compiler = shlex.split(os.environ.get("CC", "cc"))
         flags = shlex.split(os.environ.get("CFLAGS", "-O2 -g -Wall -Wextra -Werror"))
-        command = [*compiler, *flags, "-std=gnu11", "-pthread", "-I", str(folder),
-                   str(ROOT / "tests/fixtures/wine_shared_sync_client.c"), "-o", str(folder / "test")]
-        subprocess.run(command, check=True, timeout=60)
-        subprocess.run([str(folder / "test"), str(folder)], check=True, timeout=60)
+        for default_on, selection in [(0, switch), (1, default_switch)]:
+            (folder / "shared_sync_switch.inc").write_text(selection)
+            command = [*compiler, *flags, f"-DPW_TEST_SYNC_DEFAULT_ON={default_on}",
+                       "-std=gnu11", "-pthread", "-I", str(folder),
+                       str(ROOT / "tests/fixtures/wine_shared_sync_client.c"), "-o", str(folder / "test")]
+            subprocess.run(command, check=True, timeout=60)
+            subprocess.run([str(folder / "test"), str(folder)], check=True, timeout=60)
         # Ordinary builds have no shared backend: the actual wrapper falls back.
         stub = folder / "stub.c"
         stub.write_text("#include <assert.h>\n#include <stddef.h>\n"
