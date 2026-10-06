@@ -103,6 +103,7 @@ before evaluating a candidate built from that cache.
 | 0891 | `ntdll`: VirtualProtect on a writable image page reports the old protection as PAGE_READWRITE, the copied form Windows reports once the page is written; Chromium's embedded browser (Battle.net) ends the process on PAGE_WRITECOPY |
 | 0892 | `win32u`: a DIB section over a caller's section maps the view below the WoW64 limit, as the bits it allocates itself are; on the PS5 an unlimited view goes above 4 GiB (0600) and a 32-bit program wrote to the truncated address (Battle.net's software compositor) |
 | 0895 | `ntdll`: also reserve 0x68000000-0x7f000000, which Linux leaves to its own libraries, so the i386 builtin DLLs and a game's DLLs there are direct memory instead of fixed mappings of flexible memory (Battle.net's DLLs held 279 MiB of it) |
+| 0896 | `ntdll`: a process that terminates itself without `ExitProcess`'s first call (an unhandled exception, once winedbg cannot start) ends the other threads first and leaves through `exit()`, so the title's exit handlers restart it into its launcher instead of `_exit()` taking the title down |
 | 0899 | `include`: list the PS5 sync headers (0810, 0820, 0885, 0887) in `include/Makefile.in`, which makedep needs to resolve them; configure failed without it |
 
 ## Allocator
