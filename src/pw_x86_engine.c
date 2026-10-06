@@ -535,7 +535,7 @@ static int compile(PwX86Engine *engine,uint32_t pc,const PwX86CacheEntry **entry
     if(status!=PW_OK)return status;
     if(!source || !available)return PW_ERR_NOT_FOUND;
     if(available>PW_X86_ENGINE_MAX_SOURCE)available=PW_X86_ENGINE_MAX_SOURCE;
-    uint8_t scratch[PW_X86_ENGINE_MAX_CODE];
+    _Alignas(16) uint8_t scratch[PW_X86_ENGINE_MAX_CODE];
     PwX86Block best = {0};
     const PwX86TranslateOptions options = {
         engine->residency_enabled, engine->lazy_flags_enabled,
@@ -547,7 +547,9 @@ static int compile(PwX86Engine *engine,uint32_t pc,const PwX86CacheEntry **entry
         engine->fault_markers, engine->unbounded_chains, engine->call_stack_base != NULL,
         engine->superblocks, engine->native_fp, engine->call_predict,
         writable_from < available, writable_from,
-        read_trusted, engine, engine->jump_tables, engine->jump_predict };
+        read_trusted, engine, engine->jump_tables, engine->jump_predict,
+        (((uintptr_t)scratch | (uintptr_t)engine->code.write_base |
+          (uintptr_t)engine->code.exec_base | engine->cache.cursor) & 15u) == 0 };
     int last = PW_ERR_UNSUPPORTED;
     if (engine->reencode_enabled) {
         last = pw_x86_reencode(source, available, pc, scratch, sizeof(scratch), &best, &options);

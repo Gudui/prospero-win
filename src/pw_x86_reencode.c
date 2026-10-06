@@ -730,7 +730,8 @@ typedef struct Ctx {
     /* The source check (PwX86TranslateOptions.verify_source): each
      * compare's rip-relative operand and the source offset it reads, and
      * each jne to the stale exit. */
-    unsigned verify_count;
+    unsigned verify_count, verify_branches, verify_pairs;
+    unsigned aligned_source_copy;
     size_t verify_rel[MAX_VERIFY], verify_at[MAX_VERIFY], verify_jne[MAX_VERIFY];
 } Ctx;
 
@@ -1926,7 +1927,45 @@ static void emit_verify_compare(Ctx *c, unsigned width, size_t at)
     c->verify_rel[c->verify_count] = o->n; w32(o, 0);
     c->verify_at[c->verify_count] = at;
     b(o, 0x0f); b(o, 0x85);                                         /* jne stale */
-    c->verify_jne[c->verify_count++] = o->n; w32(o, 0);
+    c->verify_count++;
+    c->verify_jne[c->verify_branches++] = o->n; w32(o, 0);
+}
+
+/* Two exact 16-byte comparisons share one mismatch branch. XMM8-10 are
+ * scratch under the SysV block-entry ABI, outside the guest's XMM0-7.
+ * General output uses MOVDQU on both sides without alignment requirements.
+ * A caller that explicitly preserves copy alignment may compare directly
+ * with the immutable copy. Live reads stay unaligned and exactly 16 bytes.
+ * No checksum replaces the byte comparison. */
+static void emit_verify_pair(Ctx *c, size_t at)
+{
+    Out *o = &c->o;
+
+    if (c->verify_count + 2 > MAX_VERIFY) { o->failed = 1; return; }
+    for (unsigned part = 0; part < 2; part++) {
+        /* movdqu xmm8/9, [r10+at] */
+        b(o, 0xf3); b(o, 0x45); b(o, 0x0f); b(o, 0x6f);
+        b(o, part ? 0x8a : 0x82); w32(o, (uint32_t)(at + part * 16));
+        if (c->aligned_source_copy) {
+            /* pcmpeqb xmm8/9, [rip+aligned copy] */
+            b(o, 0x66); b(o, 0x44); b(o, 0x0f); b(o, 0x74); b(o, part ? 0x0d : 0x05);
+        } else {
+            /* movdqu xmm10, [rip+copy] */
+            b(o, 0xf3); b(o, 0x44); b(o, 0x0f); b(o, 0x6f); b(o, 0x15);
+        }
+        c->verify_rel[c->verify_count] = o->n; w32(o, 0);
+        c->verify_at[c->verify_count++] = at + part * 16;
+        if (!c->aligned_source_copy) {
+            /* pcmpeqb xmm8/9, xmm10 */
+            b(o, 0x66); b(o, 0x45); b(o, 0x0f); b(o, 0x74); b(o, part ? 0xca : 0xc2);
+        }
+    }
+    c->verify_pairs++;
+    b(o, 0x66); b(o, 0x45); b(o, 0x0f); b(o, 0xdb); b(o, 0xc1); /* pand xmm8,xmm9 */
+    b(o, 0x66); b(o, 0x45); b(o, 0x0f); b(o, 0xd7); b(o, 0xd8); /* pmovmskb r11d,xmm8 */
+    b(o, 0x41); b(o, 0x81); b(o, 0xfb); w32(o, 0xffff);          /* cmp r11d,ffff */
+    b(o, 0x0f); b(o, 0x85);
+    c->verify_jne[c->verify_branches++] = o->n; w32(o, 0);
 }
 
 /* The source check at the chain entry: the bytes the block was translated
@@ -1942,8 +1981,19 @@ static void emit_verify(Ctx *c, const uint8_t *source, size_t bytes, unsigned ke
 
     save_flags(o);
     b(o, 0x49); b(o, 0xba); w64(o, (uint64_t)(uintptr_t)source);   /* movabs r10, source */
-    for (size_t at = 0; at + width <= bytes; at += width) emit_verify_compare(c, width, at);
-    if (bytes % width) emit_verify_compare(c, width, bytes - width);
+    size_t at = 0;
+    for (; at + 32 <= bytes; at += 32) {
+        /* Keep the scalar early-mismatch/fault order at protection edges.
+         * x86's smallest protection page is 4 KiB (PS5 uses 16 KiB).
+         * Within one such page, the pair cannot touch a later inaccessible
+         * page that the original early scalar comparison would not read. */
+        if ((((uintptr_t)source + at) & 4095u) <= 4096u - 32)
+            emit_verify_pair(c, at);
+        else
+            for (unsigned part = 0; part < 4; part++) emit_verify_compare(c, 8, at + part * 8);
+    }
+    for (; at + width <= bytes; at += width) emit_verify_compare(c, width, at);
+    if (at < bytes) emit_verify_compare(c, width, bytes - width);
     if (keep) restore_flags(o);
     /* Passed: other versions may be tried again on a later failure. */
     b(o, 0xc7); b(o, 0x87); w32(o, (uint32_t)offsetof(PwX86State, verify_hops));
@@ -1957,7 +2007,7 @@ static void emit_source_copy(Ctx *c, PwX86Block *block, const uint8_t *source, s
     size_t copy, to_exit[3];
 
     if (!c->verify_count) return;
-    for (unsigned k = 0; k < c->verify_count; k++) land32(o, c->verify_jne[k]);
+    for (unsigned k = 0; k < c->verify_branches; k++) land32(o, c->verify_jne[k]);
     /* Another translation of this PC, while hops last (the flags are in r14). */
     b(o, 0x49); b(o, 0xbb); block->redirect_patch_offset = o->n; w64(o, 0); /* movabs r11, slot */
     b(o, 0x4c); b(o, 0x89); b(o, 0x9f); w32(o, (uint32_t)offsetof(PwX86State, stale_slot)); /* mov [rdi+stale_slot], r11 */
@@ -1975,7 +2025,11 @@ static void emit_source_copy(Ctx *c, PwX86Block *block, const uint8_t *source, s
     emit_leave(o, c->call_stack);
     store_state_imm(o, offsetof(PwX86State, eip), c->block_pc);
     b(o, 0xb8); w32(o, PW_X86_REENCODE_STALE); b(o, 0xc3);          /* mov eax, STALE; ret */
-    while (o->n % 8) b(o, 0xcc);
+    const size_t padding = c->aligned_source_copy && c->verify_pairs
+        ? (16u - (((uintptr_t)o->p + o->n) & 15u)) & 15u
+        : (8u - (o->n & 7u)) & 7u;
+    /* A bounded loop also terminates when capacity runs out during padding. */
+    for (size_t k = 0; k < padding; k++) b(o, 0xcc);
     copy = o->n;
     for (size_t k = 0; k < bytes; k++) b(o, source[k]);
     for (unsigned k = 0; k < c->verify_count; k++)
@@ -2089,6 +2143,7 @@ int pw_x86_reencode(const uint8_t *source, size_t bytes, uint32_t pc,
     c.source = source;
     c.source_bytes = bytes;
     c.native_fp = options->native_fp;
+    c.aligned_source_copy = options->aligned_source_copy;
     if (superblocks && options->jump_tables && options->read_trusted &&
         (c.table_entries = jump_table_entries(insts, count - 1, options)) &&
         !options->read_trusted(options->read_opaque, insts[count - 1].ea.disp,

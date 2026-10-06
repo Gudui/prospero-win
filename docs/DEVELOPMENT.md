@@ -217,3 +217,47 @@ publication audit.
 - Give every new capacity a compiled-in bound and a fail-closed overflow.
 - Add the unit test in the same commit, and prefer asserting exact values
   over presence.
+
+## Exact-byte SSE2 source verification
+
+When translated source needs verification, complete 32-byte groups use two
+16-byte SSE2 equality comparisons and one combined mismatch branch. This
+retains exact byte checks at every required entry, including plain stores
+without protection notifications. CHECKED policy, redirects, hop limits and
+cache invalidation are unchanged.
+
+General callers load both live source and its immutable copy with MOVDQU;
+output remains arbitrarily relocatable. Appended default-zero
+`aligned_source_copy` permits direct comparison against an aligned immutable
+copy only when its alignment survives publication. The engine opts in after
+checking scratch, write view, exec view and publication cursor alignment.
+Padding uses the actual output pointer and terminates on capacity exhaustion.
+The aligned path uses eight instructions per 32 bytes; the general path uses
+ten, replacing four three-instruction scalar checks. Instruction counts alone
+do not establish a runtime speedup.
+
+Live reads remain unaligned and within the source span. Incomplete groups and
+32-byte groups crossing a 4 KiB boundary retain scalar checks and the original
+mismatch-before-inaccessible-page behavior. Verification faults remain host
+source-read faults. Concurrent source mutation retains the existing lifetime
+requirements; this adds no atomic-snapshot guarantee.
+
+XMM8–10 are scratch under the generated block's SysV ABI, outside the guest's
+XMM0–7. Integer SSE2 comparisons preserve x87 and MXCSR. Both ordinary and
+native-FP entries retain guest state and bounded redirect behavior. No AVX,
+SSE4 or BMI2 requirement is added.
+
+Correctness coverage includes every byte mutation at lengths 1–480; source
+page edges; all output residues and arbitrary relocation pairs; flags, GPRs,
+XMM0–7, x87 and MXCSR; stale redirects; inaccessible spans; bounded padding;
+and actual engine publication with separate aligned or unaligned code views.
+Targeted tests, the full suite, pinned Wine contract and publication audits
+passed, with matching PS5 PRX/PE builds.
+
+Two matched PS5 San Andreas runs with all owner mods and Proper Shaders medium
+favored the candidate: 38.57→39.07 FPS and, in reverse order, 38.56→39.83 FPS.
+The trial-mean difference was approximately 0.88 FPS (2.29%). These limited
+scripted-route measurements do not establish sustained 60 FPS or gains in
+other games. A bounded Half-Life 2 compatibility run averaged approximately
+59.9 FPS. Hardware measurements used the existing owner Wine/DXVK baseline;
+validate rebuilt combined changes before release.

@@ -294,6 +294,12 @@ typedef struct PwX86TranslateOptions {
     /* With superblocks: a jump through an absolute address (an import
      * thunk's jmp [iat]) learns its target, as call_predict does. */
     unsigned jump_predict;
+    /* Opt-in publication capability: preserve the 16-byte alignment of the
+     * immutable source copy chosen relative to output's actual address.
+     * General callers leave zero; their code remains arbitrarily relocatable.
+     * The engine opts in only when scratch and both final code views have
+     * aligned bases and its publication cursor is aligned. */
+    unsigned aligned_source_copy;
 } PwX86TranslateOptions;
 
 /* The fault table of a re-encoded block with fault markers, at

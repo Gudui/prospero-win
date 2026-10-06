@@ -13,6 +13,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/wait.h>
 #include <ucontext.h>
 #include <unistd.h>
@@ -292,6 +293,384 @@ static void compare(const uint8_t *code, size_t bytes)
     same(&reencoded, &emitter);
     same(&stacked, &emitter);
     assert(!emitter.reencoded && reencoded.reencoded && stacked.reencoded);
+}
+
+/* Source verification is an exact span read, including at an inaccessible
+ * page edge. Mutating any byte must stop before the translated NOP body.
+ * Deliberately unaligned output also exercises the immutable-copy loads. */
+static void verification_nops(uint8_t *source, size_t bytes)
+{
+    for (size_t at = 0; at < bytes;) {
+        size_t n = bytes - at < 15 ? bytes - at : 15;
+        memset(source + at, 0x66, n - 1);
+        source[at + n - 1] = 0x90;
+        at += n;
+    }
+}
+
+static void verification_state(PwX86State *state, unsigned flags)
+{
+    initial(state);
+    state->eip = 0x12340000;
+    state->eflags = flags;
+    state->verify_hops = PW_X86_REENCODE_VERIFY_HOPS;
+    state->fp.x87_control = 0x077f;
+    state->fp.x87_tag = 0;
+    state->fp.mxcsr = 0x5f80;
+    for (unsigned k = 0; k < 8; k++) {
+        const long double value = (long double)(k + 1);
+        memcpy(state->fp.x87_st[k], &value, 10);
+        for (unsigned b = 0; b < 16; b++) state->fp.xmm[k][b] = (uint8_t)(k * 31 + b * 7);
+    }
+}
+
+static void verification_same(const PwX86State *actual, const PwX86State *before)
+{
+    assert(!memcmp(actual->gpr, before->gpr, sizeof(actual->gpr)));
+    assert((actual->eflags & 0xcd5) == (before->eflags & 0xcd5));
+    assert(!memcmp(actual->fp.xmm, before->fp.xmm, sizeof(actual->fp.xmm)));
+    assert(!memcmp(actual->fp.x87_st, before->fp.x87_st, sizeof(actual->fp.x87_st)));
+    assert(actual->fp.x87_control == before->fp.x87_control);
+    assert(actual->fp.x87_status == before->fp.x87_status);
+    assert(actual->fp.x87_tag == before->fp.x87_tag);
+    assert(actual->fp.mxcsr == before->fp.mxcsr);
+}
+
+static int verification_invoke(PwX86State *state, const void *code, unsigned fp)
+{
+    if (!fp) return pw_x86_run_block(state, code);
+    _Alignas(16) uint8_t image[512];
+    pw_guest_fp_to_fxsave(&state->fp, image);
+    int result = pw_x86_run_block_fp(state, code, image);
+    pw_guest_fp_from_fxsave(&state->fp, image);
+    return result;
+}
+
+static void test_exact_source_verification(void)
+{
+    static const size_t lengths[] = {1, 7, 8, 15, 16, 17, 23, 24, 31, 32, 33,
+        39, 40, 47, 48, 49, 63, 64, 65, 79, 80, 95, 96, 127, 128, 129, 145, 480};
+    const size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    uint8_t *mapping = mmap(NULL, page * 3, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    uint8_t *output = mmap(NULL, 65536, PROT_READ | PROT_WRITE | PROT_EXEC,
+                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    assert(mapping != MAP_FAILED && output != MAP_FAILED);
+    assert(!mprotect(mapping + page, page, PROT_READ | PROT_WRITE));
+    for (unsigned fp = 0; fp < 2; fp++)
+    for (unsigned edge = 0; edge < 2; edge++)
+    for (unsigned aligned_copy = 0; aligned_copy < 2; aligned_copy++)
+    for (unsigned unaligned = 0; unaligned < 16; unaligned++)
+    for (unsigned n = 0; n < sizeof(lengths) / sizeof(lengths[0]); n++) {
+        const size_t bytes = lengths[n];
+        uint8_t *source = mapping + page + (edge ? page - bytes : 0);
+        uint8_t *code = output + unaligned;
+        PwX86TranslateOptions options = {0};
+        PwX86Block block;
+        options.verify_source = options.no_counters = options.unbounded_chains = 1;
+        options.native_fp = fp;
+        options.aligned_source_copy = aligned_copy;
+        options.flat_low = low;
+        options.flat_high = low + SPAN;
+        verification_nops(source, bytes);
+        assert(pw_x86_reencode(source, bytes, 0x12340000, code, 65520, &block, &options) == PW_OK);
+        assert(block.source_bytes == bytes && block.source_copy_offset);
+        if (aligned_copy && bytes >= 32)
+            assert(!((uintptr_t)(code + block.source_copy_offset) & 15u));
+        for (unsigned f = 0; f < 2; f++) {
+            PwX86State before, state;
+            verification_state(&before, f ? 0xcd7 : 2);
+            state = before;
+            assert(verification_invoke(&state, code, fp) == PW_OK);
+            assert(state.eip == 0x12340000 + bytes);
+            assert(state.verify_hops == PW_X86_REENCODE_VERIFY_HOPS);
+            verification_same(&state, &before);
+            for (size_t at = 0; at < bytes; at++) {
+                state = before;
+                source[at] ^= 1; /* No protection notification or engine reset. */
+                assert(verification_invoke(&state, code, fp) == PW_X86_REENCODE_STALE);
+                assert(state.eip == before.eip);
+                verification_same(&state, &before);
+                source[at] ^= 1;
+            }
+        }
+        /* Internal verification reads retain their existing host-fault
+         * behavior if the exact source span itself becomes unreadable. */
+        if (bytes == 65 && !edge && !unaligned) {
+            const pid_t child = fork();
+            assert(child >= 0);
+            if (!child) {
+                const struct rlimit no_core = {0, 0};
+                PwX86State state;
+                assert(!setrlimit(RLIMIT_CORE, &no_core));
+                assert(signal(SIGSEGV, SIG_DFL) != SIG_ERR);
+                verification_state(&state, 0xcd7);
+                assert(!mprotect(mapping + page, page, PROT_NONE));
+                verification_invoke(&state, code, fp);
+                _exit(1);
+            }
+            int status;
+            assert(waitpid(child, &status, 0) == child);
+            assert(WIFSIGNALED(status) && WTERMSIG(status) == SIGSEGV);
+        }
+        /* A redirect to this same stale version must exhaust its hop bound. */
+        if (bytes == 65) {
+            uintptr_t redirect = (uintptr_t)code + block.chain_entry_offset;
+            uintptr_t slot = (uintptr_t)&redirect;
+            PwX86State before, state;
+            memcpy(code + block.redirect_patch_offset, &slot, sizeof(slot));
+            verification_state(&before, 0xcd7);
+            state = before;
+            source[32] ^= 1;
+            assert(verification_invoke(&state, code, fp) == PW_X86_REENCODE_STALE);
+            assert(state.verify_hops == 0 && state.eip == before.eip);
+            verification_same(&state, &before);
+            source[32] ^= 1;
+        }
+        if (bytes == 65) {
+            const size_t full_bytes = block.code_bytes;
+            /* Include capacities ending before and within copy-alignment
+             * padding; failure must terminate and leave the canary intact. */
+            for (size_t cap = block.source_copy_offset - 15; cap <= full_bytes; cap++) {
+                PwX86Block limited;
+                code[cap] = 0xa5;
+                const int result = pw_x86_reencode(source, bytes, 0x12340000,
+                                                   code, cap, &limited, &options);
+                assert(result == (cap < full_bytes ? PW_ERR_LIMIT : PW_OK));
+                assert(code[cap] == 0xa5);
+            }
+        }
+    }
+    assert(!munmap(mapping, page * 3));
+    assert(!munmap(output, 65536));
+}
+
+/* Default callers can relocate the complete block across every residue.
+ * No alignment capability is asserted, even if the compilation buffer happens
+ * to be aligned. Code and its copy move together without repatching. */
+static void test_source_verification_relocation(void)
+{
+    uint8_t source[65];
+    uint8_t *compiled = mmap(NULL, 65536, PROT_READ | PROT_WRITE | PROT_EXEC,
+                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    uint8_t *relocated = mmap(NULL, 65536, PROT_READ | PROT_WRITE | PROT_EXEC,
+                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    assert(compiled != MAP_FAILED && relocated != MAP_FAILED);
+    verification_nops(source, sizeof(source));
+    for (unsigned from = 0; from < 16; from++) {
+        PwX86TranslateOptions options = {0};
+        PwX86Block block;
+        options.verify_source = options.no_counters = options.unbounded_chains = 1;
+        options.flat_low = low;
+        options.flat_high = low + SPAN;
+        assert(pw_x86_reencode(source, sizeof(source), 0x12340000, compiled + from,
+                              65520, &block, &options) == PW_OK);
+        for (unsigned to = 0; to < 16; to++)
+        for (unsigned fp = 0; fp < 2; fp++) {
+            PwX86State before, state;
+            memcpy(relocated + to, compiled + from, block.code_bytes);
+            verification_state(&before, 0xcd7);
+            state = before;
+            assert(verification_invoke(&state, relocated + to, fp) == PW_OK);
+            assert(state.eip == before.eip + sizeof(source));
+            verification_same(&state, &before);
+            source[32] ^= 1;
+            state = before;
+            assert(verification_invoke(&state, relocated + to, fp) == PW_X86_REENCODE_STALE);
+            assert(state.eip == before.eip);
+            verification_same(&state, &before);
+            source[32] ^= 1;
+        }
+    }
+    assert(!munmap(compiled, 65536));
+    assert(!munmap(relocated, 65536));
+}
+
+/* A stale first-page byte must return before reading a later inaccessible
+ * page. This group crosses the boundary, so it must retain scalar order. */
+static void test_source_verification_page_order(void)
+{
+    const size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    uint8_t *mapping = mmap(NULL, page * 4, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    uint8_t *code = mmap(NULL, 65536, PROT_READ | PROT_WRITE | PROT_EXEC,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    assert(mapping != MAP_FAILED && code != MAP_FAILED);
+    assert(!mprotect(mapping + page, page * 2, PROT_READ | PROT_WRITE));
+    uint8_t *source = mapping + page * 2 - 24;
+    for (unsigned aligned_copy = 0; aligned_copy < 2; aligned_copy++)
+    for (unsigned fp = 0; fp < 2; fp++) {
+        PwX86TranslateOptions options = {0};
+        PwX86Block block;
+        PwX86State before, state;
+        options.aligned_source_copy = aligned_copy;
+        options.verify_source = options.no_counters = options.unbounded_chains = 1;
+        options.native_fp = fp;
+        options.flat_low = low;
+        options.flat_high = low + SPAN;
+        verification_nops(source, 65);
+        assert(pw_x86_reencode(source, 65, 0x12340000, code, 65536, &block, &options) == PW_OK);
+        verification_state(&before, 0xcd7);
+        state = before;
+        assert(!mprotect(mapping + page * 2, page, PROT_NONE));
+        source[0] ^= 1;
+        assert(verification_invoke(&state, code, fp) == PW_X86_REENCODE_STALE);
+        assert(state.eip == before.eip);
+        verification_same(&state, &before);
+        source[0] ^= 1;
+        assert(!mprotect(mapping + page * 2, page, PROT_READ | PROT_WRITE));
+    }
+    assert(!munmap(mapping, page * 4));
+    assert(!munmap(code, 65536));
+}
+
+/* An immutable-code test backend mirrors publication into a separate exec
+ * view. Deliberately different view residues test the capability check, not
+ * real mmap alias alignment or mutable-code coherence. Auxiliary data regions
+ * remain aligned. The code is copied on RX publication before execution. */
+typedef struct VerificationViews {
+    unsigned write_residue, exec_residue, reserves;
+} VerificationViews;
+typedef struct VerificationRegion {
+    uint8_t *write_mapping, *exec_mapping;
+    size_t bytes;
+} VerificationRegion;
+
+static int verification_reserve(void *opaque, size_t bytes, size_t alignment, PwVmRegion *out)
+{
+    VerificationViews *views = opaque;
+    VerificationRegion *region = calloc(1, sizeof(*region));
+    if (!region) return PW_ERR_LIMIT;
+    region->bytes = bytes + 4096;
+    region->write_mapping = mmap(NULL, region->bytes, PROT_READ | PROT_WRITE | PROT_EXEC,
+                                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    region->exec_mapping = mmap(NULL, region->bytes, PROT_READ | PROT_WRITE | PROT_EXEC,
+                                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    assert(region->write_mapping != MAP_FAILED && region->exec_mapping != MAP_FAILED);
+    const unsigned first = !views->reserves++;
+    *out = (PwVmRegion){
+        .write_base = region->write_mapping + (first ? views->write_residue : 0),
+        .exec_base = region->exec_mapping + (first ? views->exec_residue : 0),
+        .bytes = bytes, .alignment = alignment, .handle = region
+    };
+    return PW_OK;
+}
+
+static int verification_protect(void *opaque, const PwVmRegion *region,
+                                 size_t offset, size_t bytes, unsigned protection)
+{
+    (void)opaque;
+    assert(offset <= region->bytes && bytes <= region->bytes - offset);
+    if (protection & PW_PROT_EXEC)
+        memcpy((uint8_t *)region->exec_base + offset, (uint8_t *)region->write_base + offset, bytes);
+    return PW_OK;
+}
+
+static int verification_release(void *opaque, PwVmRegion *region)
+{
+    VerificationRegion *storage = region->handle;
+    (void)opaque;
+    assert(!munmap(storage->write_mapping, storage->bytes));
+    assert(!munmap(storage->exec_mapping, storage->bytes));
+    free(storage);
+    memset(region, 0, sizeof(*region));
+    return PW_OK;
+}
+
+static void test_source_verification_publication(void)
+{
+    static const unsigned residues[][3] = {{0, 0, 0}, {0, 1, 0}, {1, 0, 0}, {1, 7, 0}, {0, 0, 1}};
+    for (unsigned mode = 0; mode < sizeof(residues) / sizeof(residues[0]); mode++) {
+        VerificationViews views = {residues[mode][0], residues[mode][1], 0};
+        const PwVmBackend vm = {
+            .context = &views, .capabilities = PW_VM_CAP_PROTECT | PW_VM_CAP_ALIASED_EXEC,
+            .page_bytes = 4096, .reserve = verification_reserve,
+            .commit = verification_protect, .protect = verification_protect, .release = verification_release
+        };
+        PwX86CacheEntry entries[32];
+        PwX86Engine engine;
+        PwX86StepReport report;
+        PwX86State before, state;
+        uint8_t *source = guest + CODE;
+        const uint32_t displacement = 0xdead0000u - (low + CODE + 70);
+        verification_nops(source, 65);
+        source[65] = 0xe9;
+        memcpy(source + 66, &displacement, 4);
+        assert(pw_x86_engine_init(&engine, &vm, entries, 32, 1u << 16, 1, view, NULL) == PW_OK);
+        assert(pw_x86_engine_set_flat_memory(&engine, low, low + SPAN) == PW_OK);
+        assert(pw_x86_engine_set_counters(&engine, 0) == PW_OK);
+        assert(pw_x86_engine_set_reencode(&engine, 1) == PW_OK);
+        assert(pw_x86_engine_set_native_fp(&engine, 1) == PW_OK);
+        assert(pw_x86_engine_set_unbounded_chains(&engine, 1) == PW_OK);
+        assert(pw_x86_engine_set_source_view_writable(&engine, view_writable) == PW_OK);
+        engine.cache.cursor = residues[mode][2];
+        verification_state(&before, 0xcd7);
+        before.eip = low + CODE;
+        state = before;
+        assert(pw_x86_engine_step(&engine, &state, &report) == PW_OK);
+        assert(state.eip == 0xdead0000u);
+        pw_x86_engine_fp_sync(&engine, &state);
+        verification_same(&state, &before);
+        const PwX86CacheEntry *entry;
+        assert(pw_x86_cache_lookup(&engine.cache, before.eip, &entry) == PW_OK);
+        assert(entry->verify == PW_X86_VERIFY_ENTRY && entry->source_bytes == 70);
+        const uint8_t *code = (const uint8_t *)engine.code.exec_base + entry->code_offset;
+        unsigned aligned_compares = 0, copy_loads = 0;
+        for (size_t at = 0; at + 5 <= entry->body_offset; at++) {
+            if (code[at] == 0x66 && code[at + 1] == 0x44 && code[at + 2] == 0x0f &&
+                code[at + 3] == 0x74 && (code[at + 4] == 0x05 || code[at + 4] == 0x0d))
+                aligned_compares++;
+            if (code[at] == 0xf3 && code[at + 1] == 0x44 && code[at + 2] == 0x0f &&
+                code[at + 3] == 0x6f && code[at + 4] == 0x15) copy_loads++;
+        }
+        const unsigned aligned = !mode;
+        assert(aligned_compares == (aligned ? 4 : 0));
+        assert(copy_loads == (aligned ? 0 : 4));
+        if (aligned) assert(!((uintptr_t)(code + entry->source_copy_offset) & 15u));
+        printf("verification publication: write_residue=%u exec_residue=%u cursor=%u "
+               "aligned_compares=%u copy_movdqu=%u state=preserved\n",
+               residues[mode][0], residues[mode][1], residues[mode][2], aligned_compares, copy_loads);
+        pw_x86_engine_destroy(&engine);
+    }
+}
+
+/* Warmed ordinary links also enter the exact verifier with guest FP live.
+ * Both blocks exceed the SIMD threshold; one C dispatch must traverse both. */
+static void test_source_verification_fp_chain(void)
+{
+    static PwX86CacheEntry entries[512];
+    PwX86Engine engine;
+    PwX86StepReport report;
+    PwX86State before, state;
+    const uint32_t pcs[] = {low + CODE, low + CODE + 0x100};
+    const uint32_t targets[] = {pcs[1], 0xdead0000u};
+    all_writable = native_fp = unbounded = 1;
+    setup(&engine, entries, 1);
+    for (unsigned k = 0; k < 2; k++) {
+        uint8_t *source = (uint8_t *)(uintptr_t)pcs[k];
+        const uint32_t displacement = targets[k] - (pcs[k] + 37);
+        verification_nops(source, 32);
+        source[32] = 0xe9;
+        memcpy(source + 33, &displacement, 4);
+    }
+    verification_state(&before, 0xcd7);
+    before.eip = pcs[0];
+    for (unsigned pass = 0; pass < 2; pass++) {
+        const uint64_t dispatches = engine.dispatches;
+        state = before;
+        for (unsigned steps = 0; state.eip != targets[1]; steps++) {
+            assert(steps < 3);
+            assert(pw_x86_engine_step(&engine, &state, &report) == PW_OK);
+        }
+        pw_x86_engine_fp_sync(&engine, &state);
+        verification_same(&state, &before);
+        if (pass) assert(engine.dispatches - dispatches == 1);
+    }
+    for (unsigned k = 0; k < 2; k++) {
+        const PwX86CacheEntry *entry;
+        assert(pw_x86_cache_lookup(&engine.cache, pcs[k], &entry) == PW_OK);
+        assert(entry->verify == PW_X86_VERIFY_ENTRY && entry->source_bytes == 37);
+    }
+    pw_x86_engine_destroy(&engine);
+    all_writable = native_fp = unbounded = 0;
 }
 
 static void test_options(void)
@@ -2935,6 +3314,11 @@ int main(void)
         assert(!sigaction(SIGSEGV, &action, NULL));
     }
     test_options();
+    test_exact_source_verification();
+    test_source_verification_relocation();
+    test_source_verification_page_order();
+    test_source_verification_publication();
+    test_source_verification_fp_chain();
     test_prefixed_padding();
     test_registers();
     test_bit_counts();
