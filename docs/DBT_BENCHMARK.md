@@ -1082,3 +1082,60 @@ fault. The run ends by the normal GTA IV close-timeout; that is a transport
 completion rather than Wine-exit. The 58-mean/50-minimum city target remains
 unmet, and these limited alternating pairs do not establish statistical
 significance or attribute the complete runtime gain to coverage alone.
+
+## Switches, import thunks and call returns
+
+A San Andreas profile on the PS5 (Proper Shaders at medium) put a fifth of
+the main thread's translated time in block exits, and almost all of it in
+three kinds of indirect jump that went through the chain-table lookup:
+switch statements (`cmp r, n; ja default; jmp [r*4+table]`, half of it),
+calls through a register or memory, and import thunks (`jmp [iat]`, as in
+DXVK's `memcpy`). The lookup hashes the target and loads its slot before the
+host's indirect jump can resolve, so every mispredicted switch costs that
+latency on top of the guest's own.
+
+- **Jump tables.** When the two instructions before `jmp [r*4+table]` bound
+  the index (`cmp r, n` then `ja` or `jae`, which a superblock takes as a
+  side exit), the block keeps its own copy of the table: one `jmp rel32`
+  slot per entry, which starts as a side exit to the entry's target and
+  links itself the first time the target is in the chain table. The
+  dispatch is `mov r11d, index; lea r9, [rip+slots]; lea r11, [r9+r11*8];
+  jmp r11`, flag-free, so the host predicts it as it would the guest's
+  jump. The table's bytes are read through the source view, as source is,
+  and trusted only where source would be: a table on a writable page that
+  is not write-protected for its translations keeps the lookup, and a
+  change to a trusted one discards the translation as a change to code
+  does. MSVC's two-level form (`cmp s, n; ja default; movzx r, byte
+  [s+bytes]; jmp [r*4+table]`) is taken too: the index is one of the n+1
+  bytes, read the same way. At most 120 entries.
+- **Import thunks.** `jmp [address]` learns its target as a predicted call
+  does (`call_predict`): five flag-free instructions compare the target
+  with the learned one and jump straight to its chain entry; another target
+  keeps the lookup. `call [address]` is predicted the same way, without
+  `call_predict`'s other forms.
+- **Call returns.** A call's landing check compares the returned address
+  with `cmp`/`jne` instead of the flag-free five-instruction sequence when
+  the code after the call sets every arithmetic flag before it reads any
+  (`add esp, n`, `test eax, eax`), which is the usual case.
+- **Single string instructions.** Wine's msvcrt `memmove`, which DXVK and
+  d3dx9 call for every copy, aligns its destination with up to five single
+  `movs`. With fault markers and DF clear, a single `movs`, `stos` or
+  `lods` is now a load and/or store through `esi` and `edi`, listed in the
+  fault table like any other access, and `lea`s that step them; with DF set
+  it stays the host's instruction between the two `xchg rdi, r13`.
+
+On the PC (one core of an i7-12700H, loaded host, so only indicative), a
+loop dispatching an eight-way random switch went from 11.5 to 8.0 ns per
+iteration, a predictable switch from 5.9 to 2.8 ns, and a loop of two
+import calls from 9.2 to 7.8 ns. 7-Zip ran correctly with 11 tables. The
+console comparison is still to be made; `pw_wow_no_jump_tables` and
+`pw_wow_no_jump_predict` switch the first two off for it.
+
+The hotspot profile now also reports, per block, the samples in a source
+check (`verify=`, the part of `body` spent comparing a block's source with
+its copy, on pages that are checked instead of write-protected), the 40
+hottest blocks per window, and every minute all blocks with at least two
+samples (`hotcum` lines), so a module breakdown no longer depends on the
+top of each window. With `pw_wow_timing`, the first thread's cache report
+lists the host pages that went back to source checks (`smc_checked`).
+

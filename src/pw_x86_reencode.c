@@ -7,6 +7,9 @@
 enum {
     ALL_FLAGS = 0x8d5, CF = 0x001,
     MAX_INSTS = 32, MAX_COLD = 2 * MAX_INSTS,
+    /* Entries of a jump table copied into a block (emit_jump_table): its
+     * bytes must fit one source view (PW_X86_ENGINE_MAX_SOURCE). */
+    MAX_TABLE = 120, MAX_SIDE = MAX_INSTS + MAX_TABLE,
     /* Compares a source check needs at most: 8 bytes each, the last one
      * overlapping, over the longest source a block takes. */
     MAX_VERIFY = 15 * MAX_INSTS / 8 + 1,
@@ -711,10 +714,19 @@ typedef struct Ctx {
     unsigned call_stack;
     unsigned call_predict;  /* PwX86TranslateOptions.call_predict, with call_stack */
     /* Side exits (PwX86TranslateOptions.superblocks): each jcc's rel32 and
-     * target. */
+     * target, and each jump table slot's (emit_jump_table). */
     unsigned side_count;
-    size_t side_rel[MAX_INSTS];
-    uint32_t side_target[MAX_INSTS];
+    size_t side_rel[MAX_SIDE];
+    uint32_t side_target[MAX_SIDE];
+    unsigned jump_predict;          /* PwX86TranslateOptions.jump_predict */
+    /* The block's source, for what follows its call (flags_dead_at). */
+    const uint8_t *source;
+    size_t source_bytes;
+    unsigned native_fp;
+    /* The block's jump table (jump_table_entries): its entries, read
+     * through PwX86TranslateOptions.read_trusted. */
+    uint32_t table_entries;
+    const uint8_t *table_bytes;
     /* The source check (PwX86TranslateOptions.verify_source): each
      * compare's rip-relative operand and the source offset it reads, and
      * each jne to the stale exit. */
@@ -1279,13 +1291,16 @@ static void lea_r8_code(Out *o, size_t at)
 static void emit_predicted_call(Ctx *c, size_t call_rel)
 {
     Out *o = &c->o;
-    size_t hit, link, learned, hook, to_skip;
+    size_t hit, link, learned, hook, to_skip, over = 0;
     ptrdiff_t back;
 
+    /* A jump (emit_predicted_jump) goes over the hit to the site. */
+    if (!call_rel) over = jump8(o, 0xeb);
     hit = o->n;
     mov_rcx_r9(o);
     link = jump32(o);                                               /* jmp learned */
-    land32(o, call_rel);
+    if (call_rel) land32(o, call_rel);
+    else land8(o, over);
     mov_r9_rcx(o);
     b(o, 0x41); b(o, 0x8d); b(o, 0x8a); learned = o->n; w32(o, 0);  /* lea ecx, [r10+0] */
     back = (ptrdiff_t)hit - (ptrdiff_t)(o->n + 2);
@@ -1318,11 +1333,123 @@ static void emit_predicted_call(Ctx *c, size_t call_rel)
     b(o, 0x41); b(o, 0xff); b(o, 0xe3);                             /* jmp r11 */
 }
 
+/* A jump to the guest EIP in r10d through an absolute address, an import
+ * thunk's jmp [iat] (PwX86TranslateOptions.jump_predict): predicted as a
+ * call through memory is, so a thunk whose slot keeps its target goes
+ * straight to it. */
+static void emit_predicted_jump(Ctx *c)
+{
+    emit_predicted_call(c, 0);
+}
+
+/* The number of values r can have after cmp r, imm; ja (or jae) past what
+ * follows: in[k] and in[k + 1]; or 0. The jcc is a side exit, so the code
+ * after it runs only for r below that. */
+static uint32_t bounded_values(const Inst *insts, unsigned k, unsigned r, uint32_t most)
+{
+    const Inst *cmp = &insts[k], *jcc = &insts[k + 1];
+    uint32_t limit;
+
+    if (jcc->kind != K_JCC || (jcc->cond != 0x7 && jcc->cond != 0x3)) return 0;
+    if (cmp->opsize16 || cmp->lock || cmp->fs) return 0;
+    if (cmp->kind == K_RM && cmp->op_len == 1 && (cmp->op[0] == 0x83 || cmp->op[0] == 0x81) &&
+        cmp->reg == 7 && cmp->mod == 3 && cmp->rm == r)
+        limit = cmp->op[0] == 0x83 ? (uint32_t)(int32_t)(int8_t)cmp->imm[0] : rd32(cmp->imm);
+    else if (cmp->kind == K_PLAIN && cmp->len == 5 && cmp->bytes[0] == 0x3d && r == 0)
+        limit = rd32(cmp->bytes + 1);                               /* cmp eax, imm32 */
+    else
+        return 0;
+    if (jcc->cond == 0x7) return limit < most ? limit + 1 : 0;      /* ja: r <= limit */
+    return limit && limit <= most ? limit : 0;                      /* jae: r < limit */
+}
+
+/* The entries of the block's last instruction, a jump through a table of
+ * 4-byte entries whose index the instructions just before it bound, a
+ * switch's dispatch; or 0. Either cmp r, n; ja (or jae) default; jmp
+ * [r*4+table], or MSVC's two-level form, cmp s, n; ja default; movzx r, byte
+ * [s+bytes]; jmp [r*4+table], where the index is one of the n+1 bytes,
+ * read with read_trusted. */
+static uint32_t jump_table_entries(const Inst *insts, unsigned k, const PwX86TranslateOptions *options)
+{
+    const Inst *j = &insts[k], *m;
+    uint32_t count, most = 0;
+    const uint8_t *bytes;
+
+    if (k < 2 || j->kind != K_JMPRM || j->mod == 3 || j->fs || j->opsize16 ||
+        j->ea.base >= 0 || j->ea.index < 0 || j->ea.scale != 2)
+        return 0;
+    if ((count = bounded_values(insts, k - 2, (unsigned)j->ea.index, MAX_TABLE))) return count;
+    m = &insts[k - 1];
+    if (k < 3 || m->kind != K_RM || m->op_len != 2 || m->op[0] != 0x0f || m->op[1] != 0xb6 ||
+        m->mod == 3 || m->fs || m->opsize16 || m->reg != (unsigned)j->ea.index ||
+        m->ea.base < 0 || m->ea.index >= 0)
+        return 0;
+    if (!(count = bounded_values(insts, k - 3, (unsigned)m->ea.base, 4 * MAX_TABLE)) ||
+        !options->read_trusted(options->read_opaque, m->ea.disp, count, &bytes))
+        return 0;
+    for (uint32_t i = 0; i < count; i++) if (bytes[i] > most) most = bytes[i];
+    return most < MAX_TABLE ? most + 1 : 0;
+}
+
+/* The jump through the block's table: the index (zero-extended) selects
+ * one of the table's slots in the code, each a jmp rel32 that starts as a
+ * side exit to its entry's target and links itself to it the first time
+ * the target is in the chain table (emit_side_exits). All flag-free:
+ *
+ *     mov r11d, index; lea r9, [rip+slots]; lea r11, [r9+r11*8]; jmp r11
+ *     slots: jmp rel32; int3 x3 (one per entry) */
+static void emit_jump_table(Ctx *c, const Inst *in)
+{
+    Out *o = &c->o;
+    size_t slots;
+
+    rr(o, 0x89, 0, R11, host_of[in->ea.index]);                     /* mov r11d, index */
+    b(o, 0x4c); b(o, 0x8d); b(o, 0x0d); slots = o->n; w32(o, 0);    /* lea r9, [rip+slots] */
+    b(o, 0x4f); b(o, 0x8d); b(o, 0x1c); b(o, 0xd9);                 /* lea r11, [r9+r11*8] */
+    b(o, 0x41); b(o, 0xff); b(o, 0xe3);                             /* jmp r11 */
+    land32(o, slots);
+    for (uint32_t k = 0; k < c->table_entries; k++) {
+        if (c->side_count >= MAX_SIDE) { o->failed = 1; return; }
+        b(o, 0xe9);
+        c->side_rel[c->side_count] = o->n; w32(o, 0);
+        c->side_target[c->side_count++] = rd32(c->table_bytes + 4 * k);
+        b(o, 0xcc); b(o, 0xcc); b(o, 0xcc);
+    }
+}
+
+/* Whether the guest's arithmetic flags are dead at pc, in the block's
+ * source: the instructions from there define every one of them before any
+ * of them is read, and before anything that leaves the straight line. 0
+ * when that is not known. */
+static int flags_dead_at(const Ctx *c, uint32_t pc)
+{
+    size_t at = (size_t)(pc - c->block_pc);
+    uint32_t defined = 0;
+
+    for (unsigned k = 0; k < 8 && at < c->source_bytes; k++) {
+        Inst in;
+        if (!decode(c->source + at, c->source_bytes - at, pc, &in, c->native_fp)) return 0;
+        if (in.use & ~defined) return 0;
+        defined |= in.def;
+        if ((defined & ALL_FLAGS) == ALL_FLAGS) return 1;
+        switch (in.kind) {
+        case K_JMP: case K_JCC: case K_RET: case K_JMPRM: case K_CALL: case K_CALLRM:
+            return 0;
+        default:
+            break;
+        }
+        at += in.len;
+        pc += in.len;
+    }
+    return 0;
+}
+
 /* A guest call on the call stack: the guest's return address pushed, then a
  * host call, to the callee's link (direct) or to the lookup of r10d
  * (dynamic). The callee's ret comes back right after it, with the guest's
  * return address in r10d: when it is next, go on to next through a link,
- * otherwise look it up. */
+ * otherwise look it up. dynamic is 2 for a predicted callee
+ * (emit_predicted_call). */
 static void emit_call(Ctx *c, PwX86Block *block, uint32_t next, uint32_t target, int dynamic, unsigned keep)
 {
     Out *o = &c->o;
@@ -1331,18 +1458,25 @@ static void emit_call(Ctx *c, PwX86Block *block, uint32_t next, uint32_t target,
 
     emit_push(c, -1, next, keep);
     b(o, 0xe8); call_rel = o->n; w32(o, 0);                         /* call callee */
-    mov_r9_rcx(o);
-    b(o, 0x41); b(o, 0x8d); b(o, 0x8a); w32(o, 0u - next);          /* lea ecx, [r10-next] */
-    to_ok = jump8(o, 0xe3);                                         /* jrcxz ok */
-    mov_rcx_r9(o);
-    to_lookup = jump32(o);
-    land8(o, to_ok);
-    mov_rcx_r9(o);
-    rest_rel = jump32(o);                                           /* jmp next */
+    if (flags_dead_at(c, next)) {
+        /* Nothing at next reads the flags the callee left: compare. */
+        b(o, 0x41); b(o, 0x81); b(o, 0xfa); w32(o, next);           /* cmp r10d, next */
+        b(o, 0x0f); b(o, 0x85); to_lookup = o->n; w32(o, 0);        /* jne lookup */
+        rest_rel = jump32(o);                                       /* jmp next */
+    } else {
+        mov_r9_rcx(o);
+        b(o, 0x41); b(o, 0x8d); b(o, 0x8a); w32(o, 0u - next);      /* lea ecx, [r10-next] */
+        to_ok = jump8(o, 0xe3);                                     /* jrcxz ok */
+        mov_rcx_r9(o);
+        to_lookup = jump32(o);
+        land8(o, to_ok);
+        mov_rcx_r9(o);
+        rest_rel = jump32(o);                                       /* jmp next */
+    }
     emit_chain_exit(c, next, &rest, rest_rel);
     memset(&callee, 0, sizeof(callee));
     if (!dynamic) emit_chain_exit(c, target, &callee, call_rel);
-    else if (c->call_predict) emit_predicted_call(c, call_rel);
+    else if (dynamic > 1) emit_predicted_call(c, call_rel);
     else land32(o, call_rel);
     /* With a predicted callee the return's lookup is its own, so a changed
      * return address never trains the call site. */
@@ -1400,16 +1534,25 @@ static const uint8_t df_set[256] = {
 static void emit_string(Ctx *c, const Inst *in)
 {
     Out *o = &c->o;
-    size_t to_forward;
+    const unsigned op = in->op[0], width = in->width;
+    /* A single movs, stos or lods with fault markers: forwards (DF clear,
+     * the usual case) as plain moves and leas on esi and edi, each access
+     * listed in the fault table; backwards as the host's. */
+    const int simple = c->fault_markers && !in->rep &&
+                       (op == 0xa4 || op == 0xa5 || op == 0xaa || op == 0xab || op == 0xac || op == 0xad);
+    size_t to_forward, to_done = 0;
 
     mov_r9_rcx(o);
     b(o, 0x49); b(o, 0xbb); w64(o, (uint64_t)(uintptr_t)df_set);   /* movabs r11, df_set */
     b(o, 0x0f); b(o, 0xb6); b(o, 0x8f); w32(o, (uint32_t)offsetof(PwX86State, eflags) + 1);  /* movzx ecx, byte [rdi+eflags+1] */
     b(o, 0x41); b(o, 0x0f); b(o, 0xb6); b(o, 0x0c); b(o, 0x0b);    /* movzx ecx, byte [r11+rcx] */
     to_forward = jump8(o, 0xe3);                                    /* jrcxz forward */
+    if (simple) mov_rcx_r9(o);
     b(o, 0xfd);                                                     /* std */
-    land8(o, to_forward);
-    mov_rcx_r9(o);
+    if (!simple) {
+        land8(o, to_forward);
+        mov_rcx_r9(o);
+    }
     b(o, 0x4c); b(o, 0x87); b(o, 0xef);                             /* xchg rdi, r13 */
     if (in->rep) b(o, in->rep);
     if (in->opsize16) b(o, 0x66);
@@ -1417,6 +1560,21 @@ static void emit_string(Ctx *c, const Inst *in)
     b(o, in->op[0]);
     b(o, 0x4c); b(o, 0x87); b(o, 0xef);                             /* xchg rdi, r13 */
     b(o, 0xfc);                                                     /* cld */
+    if (!simple) return;
+    to_done = jump8(o, 0xeb);                                       /* jmp done */
+    land8(o, to_forward);
+    mov_rcx_r9(o);
+    if (op == 0xa4 || op == 0xa5) {                                 /* movs: r10 = [esi]; [edi] = r10 */
+        emit_frame_access_width(c, width == 1 ? 0x8a : 0x8b, R10, 6, 0, 0, 0, width);
+        emit_frame_access_width(c, width == 1 ? 0x88 : 0x89, R10, 7, 0, 1, 0, width);
+    } else if (op == 0xaa || op == 0xab) {                          /* stos: [edi] = al, ax, eax */
+        emit_frame_access_width(c, width == 1 ? 0x88 : 0x89, 0, 7, 0, 1, 0, width);
+    } else {                                                        /* lods: al, ax, eax = [esi] */
+        emit_frame_access_width(c, width == 1 ? 0x8a : 0x8b, 0, 6, 0, 0, 0, width);
+    }
+    if (op != 0xaa && op != 0xab) { b(o, 0x8d); b(o, 0x76); b(o, (uint8_t)width); }               /* lea esi, [rsi+w] */
+    if (op != 0xac && op != 0xad) { b(o, 0x45); b(o, 0x8d); b(o, 0x6d); b(o, (uint8_t)width); }   /* lea r13d, [r13+w] */
+    land8(o, to_done);
 }
 
 /* jcc rel32 to one of a div's out-of-line paths: the rel32's offset. */
@@ -1703,7 +1861,7 @@ static void emit_bit_string(Ctx *c, const Inst *in, unsigned keep)
 static void emit_side_exits(Ctx *c)
 {
     Out *o = &c->o;
-    size_t to_common[MAX_INSTS], to_hit, second_hit, to_miss;
+    size_t to_common[MAX_SIDE], to_hit, second_hit, to_miss;
     uint64_t base = (uint64_t)(uintptr_t)c->chain_table;
 
     if (!c->side_count) return;
@@ -1927,6 +2085,15 @@ int pw_x86_reencode(const uint8_t *source, size_t bytes, uint32_t pc,
     c.bounded = !options->unbounded_chains;
     c.call_stack = options->unbounded_chains && options->call_stack && c.chain_table;
     c.call_predict = c.call_stack && options->call_predict;
+    c.jump_predict = superblocks && options->jump_predict;
+    c.source = source;
+    c.source_bytes = bytes;
+    c.native_fp = options->native_fp;
+    if (superblocks && options->jump_tables && options->read_trusted &&
+        (c.table_entries = jump_table_entries(insts, count - 1, options)) &&
+        !options->read_trusted(options->read_opaque, insts[count - 1].ea.disp,
+                               4 * (size_t)c.table_entries, &c.table_bytes))
+        c.table_entries = 0;
 
     block->entry_contract.resident_mask = 0xff;
     for (unsigned g = 0; g < 8; g++)
@@ -1940,6 +2107,7 @@ int pw_x86_reencode(const uint8_t *source, size_t bytes, uint32_t pc,
     /* Source that may change unnoticed: every entry checks it first. */
     verify = options->verify_source && cursor > options->verify_from ? cursor : 0;
     if (verify) emit_verify(&c, source, verify, (insts[0].use | (live[0] & ~insts[0].def)) != 0);
+    block->body_offset = c.o.n;
 
     cursor = 0;
     for (unsigned k = 0; k < count; k++) {
@@ -2080,7 +2248,13 @@ int pw_x86_reencode(const uint8_t *source, size_t bytes, uint32_t pc,
         }
         case K_CALLRM:
             operand_r10(&c, in, keep);
-            if (c.call_stack) { emit_call(&c, block, next, 0, 1, keep); break; }
+            if (c.call_stack) {
+                /* Predicted with call_predict, and through an absolute
+                 * address (an import's call [iat]) with jump_predict. */
+                const int absolute = in->mod != 3 && in->ea.base < 0 && in->ea.index < 0 && !in->fs;
+                emit_call(&c, block, next, 0, c.call_predict || (c.jump_predict && absolute) ? 2 : 1, keep);
+                break;
+            }
             emit_push(&c, -1, next, keep);
             emit_dynamic_exit(&c);
             block->exit.kind = PW_X86_EXIT_DYNAMIC;
@@ -2096,9 +2270,17 @@ int pw_x86_reencode(const uint8_t *source, size_t bytes, uint32_t pc,
             break;
         }
         case K_JMPRM:
-            operand_r10(&c, in, keep);
-            emit_dynamic_exit(&c);
             block->exit.kind = PW_X86_EXIT_DYNAMIC;
+            if (c.table_entries && k == count - 1) {
+                emit_jump_table(&c, in);
+                block->table_entries = c.table_entries;
+                break;
+            }
+            operand_r10(&c, in, keep);
+            if (c.jump_predict && in->mod != 3 && in->ea.base < 0 && in->ea.index < 0 && !in->fs)
+                emit_predicted_jump(&c);
+            else
+                emit_dynamic_exit(&c);
             break;
         case K_JMP: {
             ExitSlots slots;

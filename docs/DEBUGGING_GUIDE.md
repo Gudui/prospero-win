@@ -451,8 +451,13 @@ it afterwards; you can name more than one.
 | --- | --- | --- |
 | `timing` | `pw_wow_timing` | Where each thread's time goes: translated code, host libraries, system calls ([section 8](#8-when-a-game-is-slow-time-it-first)) |
 | `exec-timing` | `pw_wow_exec_timing` | Sampled CPU-time estimates inside translated code, per thread |
-| `profile` | `pw_wow_profile` | The 20 translated blocks each thread spends the most samples in, every five seconds |
+| `profile` | `pw_wow_profile` | The 40 translated blocks each thread spends the most samples in, every five seconds, and every minute each block with at least two samples (`hotcum` lines) |
 | `dispatch-profile` | `pw_wow_dispatch_profile` | How often a jump between blocks finds its target in the translator's chain table, finds the slot empty, or finds another block there |
+
+Two files switch translator features off for a comparison run:
+`pw_wow_no_jump_tables` keeps the table lookup for switch statements, and
+`pw_wow_no_jump_predict` keeps it for import thunks and `call [import]`
+(see [the benchmark log](DBT_BENCHMARK.md#switches-import-thunks-and-call-returns)).
 
 They report through the game's log, which the console saves after every run
 and `pw_gameplay_run.py --save DIR` copies to your PC. If you start a game

@@ -86,6 +86,10 @@ struct pw_thread
     uint32_t last_call;
     PwCallTop sys_top, unix_top;
     PwX86HotspotProfile *profile;
+    /* The windows' rows merged (profile_merge) and reported every
+     * PROFILE_CUMULATIVE_WINDOWS windows, in full. */
+    PwX86HotspotProfile *profile_total;
+    unsigned profile_windows;
     /* Set by the fault handler when it sent this thread's translated code to
      * the refused-access path of a write to a page that was write-protected
      * for its translations (smc_pages.h): run() then carries on at that
@@ -542,6 +546,26 @@ static struct pw_thread *get_thread(void)
 #endif
         pw_x86_engine_set_call_predict( &thread->engine, thread->engine.superblocks && predict );
     }
+    /* Switches go through a copy of their jump table in the code, and import
+     * thunks (jmp [iat]) learn their target, in the same writable code as
+     * side exits (PW_WOW_JUMP_TABLES=0 and PW_WOW_JUMP_PREDICT=0, or on the
+     * console /data/prospero-win/pw_wow_no_jump_tables and
+     * pw_wow_no_jump_predict, keep the lookup). */
+    {
+        int tables = !getenv( "PW_WOW_JUMP_TABLES" ) || strcmp( getenv( "PW_WOW_JUMP_TABLES" ), "0" );
+        int jumps = !getenv( "PW_WOW_JUMP_PREDICT" ) || strcmp( getenv( "PW_WOW_JUMP_PREDICT" ), "0" );
+#ifdef __PROSPERO__
+        struct stat jump_st;
+
+        if (!stat( "/data/prospero-win/pw_wow_no_jump_tables", &jump_st )) tables = 0;
+        if (!stat( "/data/prospero-win/pw_wow_no_jump_predict", &jump_st )) jumps = 0;
+#endif
+        pw_x86_engine_set_jump_tables( &thread->engine, thread->engine.superblocks && tables );
+        pw_x86_engine_set_jump_predict( &thread->engine, thread->engine.superblocks && jumps );
+        if (first)
+            fprintf( stderr, "wowprospero jumps: tables=%u predict=%u call_predict=%u\n",
+                     thread->engine.jump_tables, thread->engine.jump_predict, thread->engine.call_predict );
+    }
     /* Calls and returns on a call stack, so the host predicts the returns
      * (PW_WOW_CALL_STACK=0 keeps the lookup); its guard sends a call that
      * runs out of it to redirect_fault. */
@@ -812,7 +836,11 @@ static const char *profile_path;
 static uint64_t profile_ticks, profile_unattributed;
 /* The report period runs on the TSC (tsc_clock.h): run() returns too often
  * for a clock_gettime there, a system call on the PS5. */
-enum { PROFILE_PERIOD_MS = 5000, PROFILE_CALIBRATION_NS = 20000000 };
+/* Every PROFILE_CUMULATIVE_WINDOWS windows a thread also reports every block
+ * of those windows with at least PROFILE_CUMULATIVE_MIN samples ("hotcum"),
+ * so the long tail can be attributed offline. */
+enum { PROFILE_PERIOD_MS = 5000, PROFILE_CALIBRATION_NS = 20000000, PROFILE_ROWS = 40,
+       PROFILE_CUMULATIVE_WINDOWS = 12, PROFILE_CUMULATIVE_MIN = 2 };
 static uint64_t profile_tsc_rate, profile_period_ticks;
 #include <sys/time.h>
 #ifndef __PROSPERO__
@@ -985,12 +1013,39 @@ static void profile_native_dump(uint64_t now, FILE *out)
     free(rows);
 }
 
+/* Add a window's rows into the thread's running total. */
+static void profile_merge(PwX86HotspotProfile *total, const PwX86HotspotProfile *window)
+{
+    total->samples += window->samples;
+    total->outside += window->outside;
+    total->stubs += window->stubs;
+    total->overflow += window->overflow;
+    for(unsigned i = 0; i < PW_X86_HOTSPOT_SLOTS; i++) {
+        const PwX86Hotspot *row = &window->slots[i];
+        unsigned bucket = (row->guest_pc * 2654435761u) & (PW_X86_HOTSPOT_SLOTS - 1), probe;
+
+        if(!row->samples) continue;
+        for(probe = 0; probe < PW_X86_HOTSPOT_SLOTS; probe++) {
+            PwX86Hotspot *to = &total->slots[bucket];
+            if(!to->samples || to->guest_pc == row->guest_pc) {
+                to->guest_pc = row->guest_pc;
+                to->samples += row->samples; to->entry += row->entry; to->body += row->body;
+                to->exit += row->exit; to->emitted += row->emitted; to->verify += row->verify;
+                break;
+            }
+            bucket = (bucket + 1) & (PW_X86_HOTSPOT_SLOTS - 1);
+        }
+        if(probe == PW_X86_HOTSPOT_SLOTS) total->overflow += row->samples;
+    }
+}
+
 static void profile_maybe_dump(void)
 {
     struct pw_thread *thread = self;
     sigset_t mask, previous;
     PwX86HotspotProfile *snapshot;
     uint64_t tsc, interval, entry_samples = 0, body_samples = 0, exit_samples = 0, emitted_samples = 0;
+    uint64_t verify_samples = 0;
     unsigned tid = HandleToULong(NtCurrentTeb()->ClientId.UniqueThread);
     FILE *out = stderr;
     char path[512];
@@ -1010,11 +1065,14 @@ static void profile_maybe_dump(void)
     memcpy(snapshot, thread->profile, sizeof(*snapshot));
     memset(thread->profile, 0, sizeof(*thread->profile));
     sigprocmask(SIG_SETMASK, &previous, NULL);
+    if(!thread->profile_total) thread->profile_total = calloc(1, sizeof(*thread->profile_total));
+    if(thread->profile_total) profile_merge(thread->profile_total, snapshot);
     for(unsigned i = 0; i < PW_X86_HOTSPOT_SLOTS; i++) {
         entry_samples += snapshot->slots[i].entry;
         body_samples += snapshot->slots[i].body;
         exit_samples += snapshot->slots[i].exit;
         emitted_samples += snapshot->slots[i].emitted;
+        verify_samples += snapshot->slots[i].verify;
     }
     qsort(snapshot->slots, PW_X86_HOTSPOT_SLOTS, sizeof(snapshot->slots[0]), compare_hotspots);
 #ifndef __PROSPERO__
@@ -1032,14 +1090,35 @@ static void profile_maybe_dump(void)
     fprintf(out, "wowprospero profile_process: ticks=%llu unattributed=%llu\n",
             (unsigned long long)__atomic_load_n(&profile_ticks, __ATOMIC_RELAXED),
             (unsigned long long)__atomic_load_n(&profile_unattributed, __ATOMIC_RELAXED));
-    fprintf(out, "wowprospero profile_parts: tid=%04x entry=%llu body=%llu exit=%llu emitted=%llu\n",
+    fprintf(out, "wowprospero profile_parts: tid=%04x entry=%llu body=%llu exit=%llu emitted=%llu verify=%llu\n",
             tid, (unsigned long long)entry_samples, (unsigned long long)body_samples,
-            (unsigned long long)exit_samples, (unsigned long long)emitted_samples);
-    for(unsigned i = 0; i < 20 && snapshot->slots[i].samples; i++) {
+            (unsigned long long)exit_samples, (unsigned long long)emitted_samples, (unsigned long long)verify_samples);
+    for(unsigned i = 0; i < PROFILE_ROWS && snapshot->slots[i].samples; i++) {
         const PwX86Hotspot *row = &snapshot->slots[i];
-        fprintf(out, "wowprospero hotspot: tid=%04x pc=%08x samples=%llu entry=%llu body=%llu exit=%llu emitted=%llu\n",
+        fprintf(out, "wowprospero hotspot: tid=%04x pc=%08x samples=%llu entry=%llu body=%llu exit=%llu emitted=%llu verify=%llu\n",
                 tid, row->guest_pc, (unsigned long long)row->samples, (unsigned long long)row->entry,
-                (unsigned long long)row->body, (unsigned long long)row->exit, (unsigned long long)row->emitted);
+                (unsigned long long)row->body, (unsigned long long)row->exit, (unsigned long long)row->emitted,
+                (unsigned long long)row->verify);
+    }
+    if(thread->profile_total && ++thread->profile_windows >= PROFILE_CUMULATIVE_WINDOWS) {
+        PwX86HotspotProfile *total = thread->profile_total;
+        unsigned rows = 0;
+
+        qsort(total->slots, PW_X86_HOTSPOT_SLOTS, sizeof(total->slots[0]), compare_hotspots);
+        while(rows < PW_X86_HOTSPOT_SLOTS && total->slots[rows].samples >= PROFILE_CUMULATIVE_MIN) rows++;
+        fprintf(out, "wowprospero hotcum_begin: tid=%04x windows=%u samples=%llu overflow=%llu rows=%u\n",
+                tid, thread->profile_windows, (unsigned long long)total->samples,
+                (unsigned long long)total->overflow, rows);
+        for(unsigned i = 0; i < rows; i++) {
+            const PwX86Hotspot *row = &total->slots[i];
+            fprintf(out, "wowprospero hotcum: tid=%04x pc=%08x s=%llu b=%llu x=%llu e=%llu v=%llu\n",
+                    tid, row->guest_pc, (unsigned long long)row->samples, (unsigned long long)row->body,
+                    (unsigned long long)row->exit, (unsigned long long)(row->entry + row->emitted),
+                    (unsigned long long)row->verify);
+        }
+        fprintf(out, "wowprospero hotcum_end: tid=%04x\n", tid);
+        memset(total, 0, sizeof(*total));
+        thread->profile_windows = 0;
     }
     profile_native_dump(pw_tsc_ms(tsc, profile_tsc_rate), out);
     if(out != stderr) fclose(out);
@@ -1205,7 +1284,7 @@ static void cache_report( struct pw_thread *thread, uint64_t wall, unsigned fina
              "generation=%u capacity=%u occupied=%llu arena_used=%zu arena_bytes=%zu "
              "hits=%llu misses=%llu probes=%llu max_probe=%u publishes=%llu resets=%llu "
              "stale=%llu retired=%llu revived=%llu smc_protects=%llu smc_faults=%llu smc_flushes=%llu "
-             "smc_demotions=%llu\n",
+             "smc_demotions=%llu jump_tables=%llu\n",
              (unsigned)(uintptr_t)NtCurrentTeb()->ClientId.UniqueThread,
              (unsigned long long)thread->cache_report_id, (unsigned long long)wall, final,
              cache->generation, cache->capacity,
@@ -1217,7 +1296,30 @@ static void cache_report( struct pw_thread *thread, uint64_t wall, unsigned fina
              (unsigned long long)thread->engine.retired_total, (unsigned long long)thread->engine.revived_blocks,
              (unsigned long long)smc.protects, (unsigned long long)__atomic_load_n( &smc.faults, __ATOMIC_RELAXED ),
              (unsigned long long)__atomic_load_n( &smc.flushes, __ATOMIC_RELAXED ),
-             (unsigned long long)__atomic_load_n( &smc.demotions, __ATOMIC_RELAXED ) );
+             (unsigned long long)__atomic_load_n( &smc.demotions, __ATOMIC_RELAXED ),
+             (unsigned long long)thread->engine.jump_table_blocks );
+    /* The host pages whose translations check their source on every entry
+     * (smc_pages.h CHECKED), once per report from the first thread only:
+     * hot code there pays for the check. */
+    if (pw_smc_enabled( &smc ) && thread->cache_report_id == 1)
+    {
+        unsigned listed = 0, checked = 0;
+        char line[512];
+        int at = 0;
+
+        for (uint32_t index = 0; index < (1u << (32 - smc.shift)); index++)
+        {
+            if (__atomic_load_n( &smc.pages[index].state, __ATOMIC_RELAXED ) != PW_SMC_CHECKED) continue;
+            checked++;
+            if (listed < 24 && at < (int)sizeof(line) - 12)
+            {
+                at += snprintf( line + at, sizeof(line) - at, " %08x", (unsigned)pw_smc_base( &smc, index ) );
+                listed++;
+            }
+        }
+        line[at] = 0;
+        fprintf( stderr, "wowprospero smc_checked: pages=%u host_page=%zu at%s\n", checked, (size_t)smc.host_page, line );
+    }
 }
 
 static void timing_report_calls( struct pw_thread *thread, double cycles, double seconds );
@@ -1670,6 +1772,7 @@ static NTSTATUS thread_term( void *args )
     self = NULL;
     if (thread->engine.fault_markers) register_arena( thread, 0 );
     free(thread->profile);
+    free(thread->profile_total);
     pw_x86_hostexec_destroy( &thread->hostexec );
     pw_x86_engine_destroy( &thread->engine );
     release( thread->entries, 0 );

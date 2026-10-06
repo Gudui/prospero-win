@@ -69,7 +69,7 @@ typedef struct Run {
     PwX86State state;
     uint8_t data[0x1000];
     int status;
-    uint64_t reencoded, chain_slots, stale;
+    uint64_t reencoded, chain_slots, stale, tables;
     unsigned steps, verified;
     unsigned host_steps;  /* instructions run by the host fallback */
 } Run;
@@ -89,6 +89,8 @@ static unsigned call_stack, call_stack_faults;
 static unsigned superblocks;
 /* run() with pw_x86_engine_set_call_predict, which needs superblocks' writable code. */
 static unsigned call_predict;
+/* run() with pw_x86_engine_set_jump_tables and set_jump_predict. */
+static unsigned jump_tables, jump_predict;
 /* run()'s re-encoder with fault markers, which only a test of a fault
  * (test_pw_x86_fault_markers.c) needs a handler for. */
 static unsigned fault_markers;
@@ -145,6 +147,8 @@ static void setup(PwX86Engine *engine, PwX86CacheEntry *entries, unsigned reenco
     assert(pw_x86_engine_set_unbounded_chains(engine, unbounded || call_stack || superblocks) == PW_OK);
     assert(pw_x86_engine_set_superblocks(engine, superblocks) == PW_OK);
     assert(pw_x86_engine_set_call_predict(engine, call_predict && superblocks) == PW_OK);
+    assert(pw_x86_engine_set_jump_tables(engine, jump_tables && superblocks) == PW_OK);
+    assert(pw_x86_engine_set_jump_predict(engine, jump_predict && superblocks) == PW_OK);
     assert(pw_x86_engine_set_native_fp(engine, native_fp && reencode) == PW_OK);
     assert(pw_x86_engine_set_fault_markers(engine, fault_markers && reencode) == PW_OK);
     assert(pw_x86_engine_set_source_view_writable(engine, all_writable ? view_writable : NULL) == PW_OK);
@@ -187,6 +191,7 @@ static Run execute(PwX86Engine *engine, const uint8_t *code, size_t bytes)
     memcpy(r.data, guest + DATA, sizeof(r.data));
     r.reencoded = engine->reencoded_blocks;
     r.stale = engine->stale_blocks;
+    r.tables = engine->jump_table_blocks;
     r.verified = 0;
     for (unsigned k = 0; k < engine->cache.capacity; k++)
         r.verified += engine->cache.entries[k].used && engine->cache.entries[k].verify;
@@ -952,6 +957,218 @@ static void test_call_predict_engine(void)
     assert(predicted.reencoded && plain.reencoded);
 }
 
+/* Returns into code that reads the flags the callee left (adc after a
+ * callee's compare: the flag-free landing check) and into code that redefines
+ * them first (the compare), including a callee that returns past its call
+ * to the instruction after next. */
+static void test_call_landings(void)
+{
+    static const uint8_t program[] = { 0xb9,0x14,0x00,0x00,0x00,0xe8,0x36,0x00,0x00,0x00,0x83,0xd3,0x00,0xe8,0x36,0x00,0x00,0x00,0x83,0xc6,0x01,0xe8,0x36,0x00,0x00,0x00,0x83,0xc7,0x01,0x49,0x75,0xe5,0xc3 };
+    static const uint8_t f1[] = { 0x31, 0xc0, 0x83, 0xf8, 0x01, 0xc3 }; /* xor eax, eax; cmp eax, 1 (CF); ret */
+    static const uint8_t f3[] = { 0x83, 0x04, 0x24, 0x03, 0xc3 };       /* add dword [esp], 3; ret */
+    uint8_t image[0x60];
+
+    memset(image, 0xcc, sizeof(image));
+    memcpy(image, program, sizeof(program));
+    memcpy(image + 0x40, f1, sizeof(f1));
+    memcpy(image + 0x48, f1, sizeof(f1));
+    memcpy(image + 0x50, f3, sizeof(f3));
+    compare(image, sizeof(image));
+    {
+        Run r = run_production(image, sizeof(image));
+        assert(r.state.gpr[3] == 0x44444444u + 20 && r.state.gpr[6] == low + DATA + 20 &&
+               r.state.gpr[7] == low + DATA + 0x100);
+    }
+}
+
+/* Switches: a jump through a table bounded by cmp and ja (or jae) just
+ * before it, its table in the code (as MSVC places it), whose targets read
+ * the flags the compare left (adc, sbb, setcc); entries past the bound
+ * that are never used; and the same switch with its table where the source
+ * view does not reach, which keeps the lookup. Each matches the emitter,
+ * with jump tables in the engine and without, and the tables were taken. */
+static void test_jump_tables(void)
+{
+    enum { T = 0xa0, T2 = 0xd0, FAR = 0x30000 };
+    static const uint8_t program[] = {
+        0xb9, 0x2c, 0x01, 0, 0,             /* 00 mov ecx, 300 */
+        0x31, 0xdb,                         /* 05 xor ebx, ebx */
+        0x31, 0xf6,                         /* 07 xor esi, esi */
+        0x89, 0xc8,                         /* 09 L: mov eax, ecx */
+        0x83, 0xe0, 0x07,                   /* 0b and eax, 7 */
+        0x83, 0xf8, 0x05,                   /* 0e cmp eax, 5 */
+        0x77, 0x2d,                         /* 11 ja D (40) */
+        0xff, 0x24, 0x85, 0, 0, 0, 0,       /* 13 jmp [eax*4+T] */
+        0x83, 0xc3, 0x01, 0xeb, 0x26,       /* 1a C0: add ebx, 1; jmp N (45) */
+        0x83, 0xc3, 0x0a, 0xeb, 0x21,       /* 1f C1: add ebx, 10; jmp N */
+        0x83, 0xd3, 0x64, 0xeb, 0x1c,       /* 24 C2: adc ebx, 100 (CF set: 2 < 5); jmp N */
+        0x83, 0xdb, 0x02, 0xeb, 0x17,       /* 29 C3: sbb ebx, 2; jmp N */
+        0x0f, 0x92, 0xc2, 0x01, 0xd3,       /* 2e C4: setb dl; add ebx, edx */
+        0xeb, 0x10,                         /* 33 jmp N */
+        0x0f, 0x94, 0xc2, 0x01, 0xd3,       /* 35 C5: sete dl (ZF: 5 == 5); add ebx, edx */
+        0xeb, 0x09,                         /* 3a jmp N */
+        0xcc, 0xcc, 0xcc, 0xcc,             /* 3c */
+        0x83, 0xeb, 0x03,                   /* 40 D: sub ebx, 3 */
+        0x90, 0x90,                         /* 43 */
+        0x89, 0xc8,                         /* 45 N: mov eax, ecx */
+        0x83, 0xe0, 0x03,                   /* 47 and eax, 3 */
+        0x3d, 0x03, 0, 0, 0,                /* 4a cmp eax, 3 */
+        0x73, 0x0b,                         /* 4f jae E (5c) */
+        0xff, 0x24, 0x85, 0, 0, 0, 0,       /* 51 jmp [eax*4+T2] */
+        0xcc, 0xcc, 0xcc, 0xcc,             /* 58 */
+        0x83, 0xc6, 0x07,                   /* 5c E: add esi, 7 */
+        0x49,                               /* 5f K: dec ecx */
+        0x75, 0xa7,                         /* 60 jnz L (09) */
+        0xc3,                               /* 62 ret */
+        0x83, 0xc6, 0x01, 0xeb, 0xf7,       /* 63 E0: add esi, 1; jmp K */
+        0x83, 0xd6, 0x02, 0xeb, 0xf2,       /* 68 E1: adc esi, 2 (CF set); jmp K */
+        0x46, 0xeb, 0xef,                   /* 6d E2: inc esi; jmp K */
+    };
+    const uint32_t code = low + CODE;
+    /* Six used entries and two past the bound that point nowhere. */
+    const uint32_t entries[8] = { code + 0x1a, code + 0x1f, code + 0x24, code + 0x29, code + 0x2e, code + 0x35,
+                                  0xdeadbeef, 0 };
+    const uint32_t second[3] = { code + 0x63, code + 0x68, code + 0x6d };
+    uint8_t image[0x100];
+    Run emitter, plain, tables, far_emitter, far_tables;
+
+    for (unsigned far = 0; far < 2; far++) {
+        const uint32_t t = far ? low + FAR : code + T;
+        memset(image, 0xcc, sizeof(image));
+        memcpy(image, program, sizeof(program));
+        memcpy(image + 0x16, &t, 4);
+        memcpy(image + 0x54, &(uint32_t){ code + T2 }, 4);
+        memcpy(image + T, entries, sizeof(entries));
+        memcpy(image + T2, second, sizeof(second));
+        if (far) memcpy(guest + FAR, entries, sizeof(entries));
+        emitter = run(image, sizeof(image), 0);
+        plain = run_superblocks(image, sizeof(image));
+        jump_tables = 1;
+        tables = run_superblocks(image, sizeof(image));
+        native_fp = fault_markers = 1;
+        far_tables = run_superblocks(image, sizeof(image));
+        native_fp = fault_markers = 0;
+        jump_tables = 0;
+        assert(emitter.status == PW_OK && emitter.state.eip == 0xdead0000u);
+        same(&plain, &emitter);
+        same(&tables, &emitter);
+        same(&far_tables, &emitter);
+        assert(!plain.tables);
+        /* Each switch is in two blocks (from L and from 00; from N and from
+         * D); with the first table far, only the second's two copy it. */
+        if (tables.tables != (far ? 2u : 4u)) fprintf(stderr, "jump tables: %llu\n", (unsigned long long)tables.tables);
+        assert(tables.tables == (far ? 2u : 4u) && far_tables.tables == tables.tables);
+        if (!far) far_emitter = emitter;
+    }
+    same(&far_emitter, &emitter);
+    /* 300 iterations, linked: the dispatcher sees each target about once. */
+    assert(tables.steps < 60);
+}
+
+/* MSVC's two-level switch: cmp, ja, then movzx of the index from a byte
+ * table, then the jump through the table it indexes; flags from the compare
+ * read by a target. The same as the emitter, with the table taken. */
+static void test_two_level_jump_tables(void)
+{
+    enum { BYTES = 0x80, T = 0x90 };
+    static const uint8_t program[] = {
+        0xb9, 0x2c, 0x01, 0, 0,             /* 00 mov ecx, 300 */
+        0x31, 0xdb,                         /* 05 xor ebx, ebx */
+        0x89, 0xc8,                         /* 07 L: mov eax, ecx */
+        0x83, 0xe0, 0x07,                   /* 09 and eax, 7 */
+        0x83, 0xf8, 0x05,                   /* 0c cmp eax, 5 */
+        0x77, 0x1b,                         /* 0f ja D (2c) */
+        0x0f, 0xb6, 0x90, 0, 0, 0, 0,       /* 11 movzx edx, byte [eax+BYTES] */
+        0xff, 0x24, 0x95, 0, 0, 0, 0,       /* 18 jmp [edx*4+T] */
+        0x83, 0xc3, 0x01, 0xeb, 0x0e,       /* 1f C0: add ebx, 1; jmp N (32) */
+        0x83, 0xd3, 0x0a, 0xeb, 0x09,       /* 24 C1: adc ebx, 10 (CF: eax < 5); jmp N */
+        0x90, 0x90, 0x90,                   /* 29 */
+        0x83, 0xeb, 0x03,                   /* 2c D: sub ebx, 3 */
+        0x90, 0x90, 0x90,                   /* 2f */
+        0x49,                               /* 32 N: dec ecx */
+        0x75, 0xd2,                         /* 33 jnz L (07) */
+        0xc3,                               /* 35 ret */
+    };
+    static const uint8_t bytes[6] = { 0, 1, 1, 0, 1, 0 };
+    const uint32_t code = low + CODE;
+    const uint32_t entries[2] = { code + 0x1f, code + 0x24 };
+    uint8_t image[0xa0];
+    Run emitter, tables;
+
+    memset(image, 0xcc, sizeof(image));
+    memcpy(image, program, sizeof(program));
+    memcpy(image + 0x14, &(uint32_t){ code + BYTES }, 4);
+    memcpy(image + 0x1b, &(uint32_t){ code + T }, 4);
+    memcpy(image + BYTES, bytes, sizeof(bytes));
+    memcpy(image + T, entries, sizeof(entries));
+    emitter = run(image, sizeof(image), 0);
+    jump_tables = 1;
+    native_fp = fault_markers = 1;
+    tables = run_superblocks(image, sizeof(image));
+    native_fp = fault_markers = 0;
+    jump_tables = 0;
+    assert(emitter.status == PW_OK && emitter.state.eip == 0xdead0000u);
+    same(&tables, &emitter);
+    assert(tables.tables >= 1);
+}
+
+/* An import thunk, jmp [slot], and an import call, call [slot2], with jump
+ * prediction: each learns its target, the program then changes both slots,
+ * and later calls go to the new target (the prediction misses and looks it
+ * up); the same as the emitter. */
+static void test_jump_predict(void)
+{
+    enum { SLOT = 0x30000, SLOT2 = 0x30010, THUNK = 0x40, F1 = 0x50, F2 = 0x60 };
+    static const uint8_t program[] = {
+        0xb9, 100, 0, 0, 0,                 /* 00 mov ecx, 100 */
+        0xe8, 0x36, 0, 0, 0,                /* 05 L: call THUNK (40) */
+        0xff, 0x15, 0, 0, 0, 0,             /* 0a call [SLOT2] */
+        0x83, 0xf9, 0x32,                   /* 10 cmp ecx, 50 */
+        0x75, 0x14,                         /* 13 jne K (29) */
+        0xc7, 0x05, 0, 0, 0, 0, 0, 0, 0, 0, /* 15 mov dword [SLOT], F2 */
+        0xc7, 0x05, 0, 0, 0, 0, 0, 0, 0, 0, /* 1f mov dword [SLOT2], F2 */
+        0x49,                               /* 29 K: dec ecx */
+        0x75, 0xd9,                         /* 2a jnz L */
+        0xc3,                               /* 2c ret */
+    };
+    static const uint8_t thunk[] = { 0xff, 0x25, 0, 0, 0, 0 };   /* jmp [SLOT] */
+    static const uint8_t f1[] = { 0x83, 0xc3, 0x01, 0xc3 };       /* add ebx, 1 */
+    static const uint8_t f2[] = { 0x83, 0xc3, 0x64, 0xc3 };       /* add ebx, 100 */
+    const uint32_t code = low + CODE, slot = low + SLOT, slot2 = low + SLOT2, f2_pc = code + F2;
+    uint8_t image[0x80];
+    Run emitter, plain, predicted, production;
+
+    memset(image, 0xcc, sizeof(image));
+    memcpy(image, program, sizeof(program));
+    memcpy(image + 0x0c, &slot2, 4);
+    memcpy(image + 0x17, &slot, 4);
+    memcpy(image + 0x1b, &f2_pc, 4);
+    memcpy(image + 0x21, &slot2, 4);
+    memcpy(image + 0x25, &f2_pc, 4);
+    memcpy(image + THUNK, thunk, sizeof(thunk));
+    memcpy(image + THUNK + 2, &slot, 4);
+    memcpy(image + F1, f1, sizeof(f1));
+    memcpy(image + F2, f2, sizeof(f2));
+#define RESET_SLOTS() do { memcpy(guest + SLOT, &(uint32_t){ code + F1 }, 4); \
+                           memcpy(guest + SLOT2, &(uint32_t){ code + F1 }, 4); } while (0)
+    RESET_SLOTS();
+    emitter = run(image, sizeof(image), 0);
+    RESET_SLOTS();
+    plain = run_superblocks(image, sizeof(image));
+    jump_predict = 1;
+    RESET_SLOTS();
+    predicted = run_superblocks(image, sizeof(image));
+    RESET_SLOTS();
+    production = run_production(image, sizeof(image));
+    jump_predict = 0;
+#undef RESET_SLOTS
+    assert(emitter.status == PW_OK && emitter.state.eip == 0xdead0000u);
+    assert(emitter.state.gpr[3] == 0x44444444u + 2 * 51 + 2 * 49 * 100);
+    same(&plain, &emitter);
+    same(&predicted, &emitter);
+    same(&production, &emitter);
+}
+
 /* A branchy loop whose side exits are taken on alternate iterations, and
  * one taken from the fallthrough of another: with superblocks the result
  * matches the emitter, and once each side exit has linked itself the loop
@@ -1015,13 +1232,17 @@ static void test_strings(void)
      * the emitter's side) runs on the host. */
     hostexec_fallback = 1;
     compare(code, sizeof(code));
-    r = run_superblocks(lods, sizeof(lods));
+    /* With fault markers as well, where single lods forwards are plain
+     * moves (emit_string). */
+    for (unsigned production = 0; production < 2; production++) {
+        r = production ? run_production(lods, sizeof(lods)) : run_superblocks(lods, sizeof(lods));
+        assert(r.status == PW_OK && r.state.eip == 0xdead0000u);
+        assert(r.state.gpr[3] == pattern(35));                          /* lodsl */
+        assert((r.state.gpr[0] & 0xffffff00u) == ((pattern(35) & 0xffff0000u) | (pattern(39) & 0xff00u)));
+        assert((r.state.gpr[0] & 0xff) == (pattern(41) & 0xff));         /* lodsb after std */
+        assert(r.state.gpr[6] == low + DATA + 40);                      /* esi went back one */
+    }
     hostexec_fallback = 0;
-    assert(r.status == PW_OK && r.state.eip == 0xdead0000u);
-    assert(r.state.gpr[3] == pattern(35));                              /* lodsl */
-    assert((r.state.gpr[0] & 0xffffff00u) == ((pattern(35) & 0xffff0000u) | (pattern(39) & 0xff00u)));
-    assert((r.state.gpr[0] & 0xff) == (pattern(41) & 0xff));             /* lodsb after std */
-    assert(r.state.gpr[6] == low + DATA + 40);                          /* esi went back one */
 }
 
 static void test_native_fp(void)
@@ -2732,6 +2953,10 @@ int main(void)
     test_superblocks();
     test_call_predict_site();
     test_call_predict_engine();
+    test_call_landings();
+    test_jump_tables();
+    test_two_level_jump_tables();
+    test_jump_predict();
     test_strings();
     test_native_fp();
     test_native_fp_forms();

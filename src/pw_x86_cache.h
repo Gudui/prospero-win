@@ -31,6 +31,7 @@ typedef struct PwX86CacheEntry {
     uint32_t pending_head;
     size_t fault_table_offset;  /* PwX86Block.fault_table_offset */
     size_t exit_offset;         /* PwX86Block.exit_offset */
+    size_t body_offset;         /* PwX86Block.body_offset */
     uint32_t arena_next;        /* the next block in the arena, as index + 1 */
     unsigned used;
     /* A block whose source may change unnoticed keeps a copy of it at

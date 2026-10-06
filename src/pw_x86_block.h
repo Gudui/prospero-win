@@ -147,6 +147,11 @@ typedef struct PwX86Block {
      * slot (a pointer to a chain entry, or NULL), which the owner patches;
      * 0 without a source check. */
     size_t redirect_patch_offset;
+    /* Where the block's first instruction starts, after its source check
+     * (0: not recorded). */
+    size_t body_offset;
+    /* Entries of the jump table the block copied (jump_tables), or 0. */
+    uint32_t table_entries;
 } PwX86Block;
 
 /* Initial bounded DBT subset: push immediate/register/memory, pop register,
@@ -274,6 +279,21 @@ typedef struct PwX86TranslateOptions {
      * the guest state untouched, and returns PW_X86_REENCODE_STALE. */
     unsigned verify_source;
     size_t verify_from;
+    /* Guest bytes outside the block's source that its translation may
+     * keep, as it keeps its source: bytes [address, address + bytes) when
+     * they are readable and trusted as source is (a change discards the
+     * translation), with *data where to read them; 0 otherwise. NULL: none
+     * are. */
+    int (*read_trusted)(void *opaque, uint32_t address, size_t bytes, const uint8_t **data);
+    void *read_opaque;
+    /* With superblocks and read_trusted: a jump through a table bounded by
+     * the compare and branch just before it (cmp r, n; ja; jmp [r*4+t]) goes
+     * through its own copy of the table, a slot per entry that links itself
+     * to the entry's target as a side exit does. */
+    unsigned jump_tables;
+    /* With superblocks: a jump through an absolute address (an import
+     * thunk's jmp [iat]) learns its target, as call_predict does. */
+    unsigned jump_predict;
 } PwX86TranslateOptions;
 
 /* The fault table of a re-encoded block with fault markers, at
