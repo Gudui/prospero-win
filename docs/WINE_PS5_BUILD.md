@@ -100,6 +100,7 @@ before evaluating a candidate built from that cache.
 | 0770 | `server`, `ntdll`: on PS5, the client thread runs sync-object and handle requests itself under a server lock instead of waking the server thread twice through the pipes; see [Sync requests on the client threads](#sync-requests-on-the-client-threads) |
 | 0790 | `server`, `ntdll`: opt-in immediate mutex acquire/release using the authoritative server object without request marshalling or waiter allocation; see [Immediate mutex calls](#immediate-mutex-calls) |
 | 0890 | `ntdll`: before starting the in-process server, give it ntdll's count of name changes (its `pw_cwd_share_changes` export), since the server creates, renames and deletes the files of ntdll's handles, and keep 0160's listings only when it took it. `WINE_PS5_DIR_LISTINGS=0` turns them off; the log says which |
+| 0891 | `ntdll`: VirtualProtect on a writable image page reports the old protection as PAGE_READWRITE, the copied form Windows reports once the page is written; Chromium's embedded browser (Battle.net) ends the process on PAGE_WRITECOPY |
 | 0899 | `include`: list the PS5 sync headers (0810, 0820, 0885, 0887) in `include/Makefile.in`, which makedep needs to resolve them; configure failed without it |
 
 ## Allocator
@@ -1014,12 +1015,12 @@ Host tests verify the operation reduction; console benefit remains unmeasured.
 `PROSPERO_WINE_SOURCE=/path/to/pinned/wine python3 tests/test_ws2_fqdn.py`
 also executes the actual ANSI/wide registry functions from that source.
 
-Patch 0780 keeps that name between calls, but only while a registry change
+Patch 0891 keeps that name between calls, but only while a registry change
 notification on `HKLM\System` (where `GetComputerNameExW` reads it) has not
 fired. The watch covers the whole subtree, names and values, and is armed
 before the name is read, so any change after a read makes the next call read
 the registry again. A failed address lookup uses the name to determine
-whether the requested host is this machine. With 0780, repeated calls check
+whether the requested host is this machine. With 0891, repeated calls check
 the watch with one zero-timeout wait instead of rereading the registry.
 If the watch cannot be armed, each call reads the registry normally. Failed
 name reads are retried; the ANSI conversion still runs on each call, and
@@ -1030,7 +1031,7 @@ of registry notifications, changes during a read, allocation/API failures
 and cleanup. Like 0760, the patch requires rebuilt Windows `ws2_32.dll`
 files for both architectures.
 
-The console owner reports about 52 FPS for a configuration combining 0780
+The console owner reports about 52 FPS for a configuration combining 0891
 with high-byte translator changes, versus 48.6 FPS for the control. This
 comparison does not isolate either change's contribution; a second control
 attempt failed during loading. Matching DLL source identities are audited,

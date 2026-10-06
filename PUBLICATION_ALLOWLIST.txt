@@ -380,3 +380,6 @@ tools/build_wine_sync_ordinary.py
 wine/patches/0888-ntdll-ps5-shared-sync-default-on.patch
 wine/patches/0890-ntdll-ps5-share-name-changes-with-the-server.patch
 wine/patches/0899-include-list-the-ps5-headers-for-makedep.patch
+tests/test_wine_protect_writecopy.py
+tests/wine_protect_writecopy.c
+wine/patches/0891-ntdll-report-a-re-protected-image-page-as-copied.patch
