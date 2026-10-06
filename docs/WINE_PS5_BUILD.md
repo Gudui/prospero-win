@@ -101,6 +101,7 @@ before evaluating a candidate built from that cache.
 | 0790 | `server`, `ntdll`: opt-in immediate mutex acquire/release using the authoritative server object without request marshalling or waiter allocation; see [Immediate mutex calls](#immediate-mutex-calls) |
 | 0890 | `ntdll`: before starting the in-process server, give it ntdll's count of name changes (its `pw_cwd_share_changes` export), since the server creates, renames and deletes the files of ntdll's handles, and keep 0160's listings only when it took it. `WINE_PS5_DIR_LISTINGS=0` turns them off; the log says which |
 | 0891 | `ntdll`: VirtualProtect on a writable image page reports the old protection as PAGE_READWRITE, the copied form Windows reports once the page is written; Chromium's embedded browser (Battle.net) ends the process on PAGE_WRITECOPY |
+| 0892 | `win32u`: a DIB section over a caller's section maps the view below the WoW64 limit, as the bits it allocates itself are; on the PS5 an unlimited view goes above 4 GiB (0600) and a 32-bit program wrote to the truncated address (Battle.net's software compositor) |
 | 0899 | `include`: list the PS5 sync headers (0810, 0820, 0885, 0887) in `include/Makefile.in`, which makedep needs to resolve them; configure failed without it |
 
 ## Allocator
@@ -318,7 +319,7 @@ two paths.
 
 ## Immediate mutex calls
 
-Patch 0790 adds a candidate path for ordinary server mutexes that are ready
+Patch 0892 adds a candidate path for ordinary server mutexes that are ready
 immediately. It is **off by default**. With client-thread requests enabled,
 set `WINE_PS5_MUTEX_FAST=1`, or put `1` (optionally followed by one newline)
 in `<Wine prefix>/pw_mutex_fast`, to bind `pw_wineserver_try_fast_mutex`; ntdll
