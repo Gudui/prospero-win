@@ -102,6 +102,7 @@ before evaluating a candidate built from that cache.
 | 0890 | `ntdll`: before starting the in-process server, give it ntdll's count of name changes (its `pw_cwd_share_changes` export), since the server creates, renames and deletes the files of ntdll's handles, and keep 0160's listings only when it took it. `WINE_PS5_DIR_LISTINGS=0` turns them off; the log says which |
 | 0891 | `ntdll`: VirtualProtect on a writable image page reports the old protection as PAGE_READWRITE, the copied form Windows reports once the page is written; Chromium's embedded browser (Battle.net) ends the process on PAGE_WRITECOPY |
 | 0892 | `win32u`: a DIB section over a caller's section maps the view below the WoW64 limit, as the bits it allocates itself are; on the PS5 an unlimited view goes above 4 GiB (0600) and a 32-bit program wrote to the truncated address (Battle.net's software compositor) |
+| 0895 | `ntdll`: also reserve 0x68000000-0x7f000000, which Linux leaves to its own libraries, so the i386 builtin DLLs and a game's DLLs there are direct memory instead of fixed mappings of flexible memory (Battle.net's DLLs held 279 MiB of it) |
 | 0899 | `include`: list the PS5 sync headers (0810, 0820, 0885, 0887) in `include/Makefile.in`, which makedep needs to resolve them; configure failed without it |
 
 ## Allocator
@@ -161,7 +162,10 @@ memory of type `0x0c`, a fixed map over a reservation), mapped CPU read-write
 unless the kernel wants the GPU bits xash3d maps with. Before the first
 region is used, a self-check maps a page, writes it, makes it read-execute
 and frees it; if the console refuses any step, every call passes through as
-before and the log says so. A 16 GiB reserved area at `0x1000000000`, where
+before and the log says so. The low reserved areas cover 0x10000-0x7fff0000
+whole (patch 0895): Linux's layout leaves 0x68000000-0x7f000000 to its own
+libraries, and there the i386 builtin DLLs and a game's DLLs were fixed
+mappings of flexible memory. A 16 GiB reserved area at `0x1000000000`, where
 the kernel grants the whole range at the hint, takes the views whose limits
 allow it before the low areas are searched, so the i386 guest keeps the low
 4 GiB. An i386 image's limit is 4 GiB (0601): the main exe is mapped where
