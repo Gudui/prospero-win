@@ -1006,7 +1006,12 @@ The runtime is staged beside the title:
   Unix side, without which `crypt32.dll` refuses to load: FFmpeg's
   `avformat` imports it, so LAV Filters, the DirectShow splitter and
   decoders Warcraft III's cinematics play through, need it (the console's
-  Wine has no GStreamer, which Wine's own splitters are built on);
+  Wine has no GStreamer, which Wine's own splitters are built on); and
+  `dwrite.prx`, DirectWrite's Unix side, which measures and rasterises glyphs
+  with FreeType through `libfreetype.prx` (whose exports include what
+  `dlls/dwrite/freetype.c` loads): without it every glyph call a DirectWrite
+  client makes goes through a NULL function table, and Chromium (Battle.net's
+  login page) aborts laying out text;
 - Wine's NLS files under `win/wine/share/wine/nls`.
 
 Patch 0760 reduces repeated registry work in the Windows `ws2_32.dll`
