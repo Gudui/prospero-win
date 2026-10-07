@@ -947,9 +947,10 @@ int main(int argc, char **argv)
 
     /* An autostart title's game has ended and the title restarted into its
      * launcher: go back to Home from here, before Wine is loaded. Exiting the
-     * game's own process instead raced Wine's threads (SIGSYS). */
+     * game's own process instead raced Wine's threads (SIGSYS). A restart's
+     * argv starts with its first word (launcher=1 cycle=N gives argc 2). */
     if (PW_AUTOSTART_PROFILE[0] != '\0')
-        for (int i = 1; i < argc; i++)
+        for (int i = 0; i < argc; i++)
             if (argv[i] && !strncmp(argv[i], "launcher=", 9)) return 0;
     ps5log_config_defaults(&log_config);
     if (ps5log_load_config(ps5log_default_conf_paths, ps5log_default_conf_path_count,
