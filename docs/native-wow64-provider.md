@@ -16,9 +16,15 @@ fixture. It accepts the supported module metadata and rejects malformed,
 unknown and ELF-loader identities with zero output pointers. This checks
 metadata only; it does not prove kernel signal delivery or guest execution.
 
-A separately linked private provider has passed physical-console native
-Minesweeper, worker TLS, access-violation/UD2 resumption with x87/XMM0/YMM0,
-and Space Cadet gameplay/audio. The same provider passed DBT Minesweeper
-and Space Cadet controls, with original console files restored after each
-run. The repository patch still needs a fresh build and console validation.
-HL2, GTA SA, GTA IV, DXVK/d3dx9 performance and DBT retirement remain open.
+The full patched Wine pipeline builds all PRXs without unresolved imports.
+On a physical console, its freshly built ntdll passed simultaneous native
+Win32 worker TLS/TEB/thread-ID checks, native Minesweeper with scripted input,
+access-violation/UD2 resumption with x87/XMM0/YMM0, and a DBT Minesweeper
+fallback control using that same provider. Each run exited normally with
+capabilities 7 and restored and verified the original console files.
+
+An earlier private provider also passed native and DBT Space Cadet gameplay
+and audio. Those results do not establish Space Cadet correctness for the
+fresh full-build provider. HL2, GTA SA, GTA IV, DXVK/d3dx9 performance and DBT
+retirement remain open. The backend stays opt-in through the Wow64 registry
+selection; wowprospero remains available as the fallback.
