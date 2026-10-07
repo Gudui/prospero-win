@@ -10,8 +10,9 @@
  * launcher.
  *
  * A title built with PW_AUTOSTART_PROFILE (tools/build_native.sh) opens
- * that profile's game when started from Home, and returns to Home instead
- * of the launcher when the game ends, so one tile is one game.
+ * that profile's game when started from Home. When the game ends the title
+ * restarts as usual, and the restarted process returns to Home before it
+ * loads Wine, so one tile is one game.
  *
  * The launcher and a game request the /data mount, where the library is.
  * A game then loads ntdll.prx, prepares Wine's
@@ -627,23 +628,12 @@ static void restart_title(const PwWineApp *app, uint32_t cycle, const char *reas
     }
 }
 
-/* Leave a game that ended: back to the launcher, or to Home in an autostart
- * title, whose launcher would only start the same game again. */
-static void leave_game(uint32_t cycle, const char *reason)
-{
-    if (PW_AUTOSTART_PROFILE[0]) {
-        PS5LOG_LOG("PW_WINE64 autostart leave reason=%s to=home", reason);
-        return;
-    }
-    restart_title(NULL, cycle, reason);
-}
-
 /* Wine ends the process with exit() when its last program ends: go back to
  * the launcher. */
 static void on_exit_report(void)
 {
     PS5LOG_LOG("PW_WINE64 exit sink_calls=%lu", sink_calls);
-    leave_game(launch.cycle + 1u, "wine-exit");
+    restart_title(NULL, launch.cycle + 1u, "wine-exit");
     pw_diagnostics_close("wine64-exit");
 }
 
@@ -955,6 +945,12 @@ int main(int argc, char **argv)
     int status, video_status = PW_ERR_STATE, pad_status = PW_ERR_STATE, hid_status = PW_ERR_STATE;
     uint64_t close_requested = 0, combo_ticks = 0, started = now_ns();
 
+    /* An autostart title's game has ended and the title restarted into its
+     * launcher: go back to Home from here, before Wine is loaded. Exiting the
+     * game's own process instead raced Wine's threads (SIGSYS). */
+    if (PW_AUTOSTART_PROFILE[0] != '\0')
+        for (int i = 1; i < argc; i++)
+            if (argv[i] && !strncmp(argv[i], "launcher=", 9)) return 0;
     ps5log_config_defaults(&log_config);
     if (ps5log_load_config(ps5log_default_conf_paths, ps5log_default_conf_path_count,
                            &log_config, NULL) == 0)
@@ -1328,7 +1324,7 @@ int main(int argc, char **argv)
         }
         if (close_requested && now - close_requested >= (uint64_t)PW_WINE64_CLOSE_WAIT_S * 1000000000u) {
             PS5LOG_LOG("PW_WINE64 close timeout: leaving the game");
-            leave_game(launch.cycle + 1u, "close-timeout");
+            restart_title(NULL, launch.cycle + 1u, "close-timeout");
             break;
         }
         if (tick % 60 == 0) {
@@ -1398,7 +1394,7 @@ int main(int argc, char **argv)
         }
     }
     PS5LOG_LOG("PW_WINE64 done status=%d stage=%d", status, start.stage);
-    if (status != PW_OK) leave_game(launch.cycle + 1u, "start-failed");
+    if (status != PW_OK) restart_title(NULL, launch.cycle + 1u, "start-failed");
     pw_diagnostics_close(status == PW_OK ? "wine64-restart-failed" : "wine64-start-failed");
     _exit(1);
 }
