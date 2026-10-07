@@ -41,7 +41,8 @@ def main() -> int:
     require(native, f'#define PW_APP_NAME "{APP_NAME}-wine64"', "native/wine64_main.c")
 
     builder = (ROOT / "tools/build_native.sh").read_text()
-    require(builder, f"title_id={TITLE_ID}", "tools/build_native.sh")
+    # The default; PW_TITLE_ID builds another title, such as an autostart tile.
+    require(builder, f"title_id=${{PW_TITLE_ID:-{TITLE_ID}}}", "tools/build_native.sh")
     require(builder, 'dist="$root/dist/$title_id$output_suffix"',
             "tools/build_native.sh")
     require(builder, 'build="$root/build/native$output_suffix"',

@@ -19,6 +19,14 @@
 #   PW_WINE64_WAIT_WATCHDOG 1 turns on Wine's wait watchdog (patch 0680) in
 #                          every game: a snapshot of the server's waits every
 #                          two seconds, for diagnosing stalls (default 0)
+#   PW_TITLE_ID            the title ID (default PPSA99995); the Lapy helper
+#                          must be built for the same ID
+#   PW_TITLE_NAME          the home-screen name (default param.json's)
+#   PW_TITLE_ICON          a 512x512 PNG for the tile (default sce_sys/icon0.png)
+#   PW_AUTOSTART_PROFILE   a profile id: the title opens that game instead of
+#                          the launcher and returns to Home when it ends
+#   PW_LAPY_HELPER_DIR     a directory with lapy.elf and lapy-manifest.json
+#                          to use instead of the latest published release
 #   Lapy helper             fetched from the latest published GitHub release
 set -euo pipefail
 
@@ -33,7 +41,16 @@ wine64_script=${PW_WINE64_SCRIPT:-0}
 wine64_seconds=${PW_WINE64_SECONDS:-0}
 wine64_cycles=${PW_WINE64_SCRIPT_CYCLES:-2}
 wine64_watchdog=${PW_WINE64_WAIT_WATCHDOG:-0}
-title_id=PPSA99995
+title_id=${PW_TITLE_ID:-PPSA99995}
+title_name=${PW_TITLE_NAME:-}
+title_icon=${PW_TITLE_ICON:-}
+autostart_profile=${PW_AUTOSTART_PROFILE:-}
+[[ $title_id =~ ^[A-Z]{4}[0-9]{5}$ ]] || {
+    echo "PW_TITLE_ID must be four capitals and five digits" >&2; exit 2; }
+[[ $autostart_profile =~ ^[A-Za-z0-9_.-]*$ ]] || {
+    echo "PW_AUTOSTART_PROFILE must contain only letters, digits, '_', '.' or '-'" >&2; exit 2; }
+[[ -z $title_icon || -f $title_icon ]] || {
+    echo "PW_TITLE_ICON $title_icon does not exist" >&2; exit 2; }
 
 [[ $native_mode == wine64 ]] || {
     echo "PW_NATIVE_MODE must be wine64: the direct Win32 runtime was removed" >&2; exit 2; }
@@ -49,8 +66,14 @@ title_id=PPSA99995
 }
 helper_download=$(mktemp -d "${TMPDIR:-/tmp}/prospero-lapy-helper.XXXXXX")
 trap 'rm -rf -- "$helper_download"' EXIT
-python3 "$root/tools/fetch_lapy_helper.py" \
-    --repo mpereiraesaa/PS5-Lapy-JB-Daemon --out "$helper_download"
+if [[ -n ${PW_LAPY_HELPER_DIR:-} ]]; then
+    cp "$PW_LAPY_HELPER_DIR/lapy.elf" "$PW_LAPY_HELPER_DIR/lapy-manifest.json" "$helper_download/"
+    printf '{"repository": "local", "source": "%s"}\n' "$PW_LAPY_HELPER_DIR" \
+        > "$helper_download/release.json"
+else
+    python3 "$root/tools/fetch_lapy_helper.py" \
+        --repo mpereiraesaa/PS5-Lapy-JB-Daemon --out "$helper_download"
+fi
 lapy_helper_elf="$helper_download/lapy.elf"
 helper_magic=$(od -An -tx1 -N4 "$lapy_helper_elf" | tr -d ' \n')
 [[ $helper_magic == 7f454c46 ]] || {
@@ -143,7 +166,8 @@ common=(-DPW_BUILD_ID=\""$build_id"\" -O2 -Wall -Wextra -Werror -ffunction-secti
         -I"$root/include" -I"$root/src" -I"$root/native"
         -I"$root/native/ps5log"
         -DPW_WINE64_SCRIPT="$wine64_script" -DPW_WINE64_SECONDS="$wine64_seconds"
-        -DPW_WINE64_SCRIPT_CYCLES="$wine64_cycles" -DPW_WINE64_WAIT_WATCHDOG="$wine64_watchdog")
+        -DPW_WINE64_SCRIPT_CYCLES="$wine64_cycles" -DPW_WINE64_WAIT_WATCHDOG="$wine64_watchdog"
+        -DPW_TITLE_ID=\""$title_id"\" -DPW_AUTOSTART_PROFILE=\""$autostart_profile"\")
 
 sources=(
     native/wine64_main.c native/pw_diagnostics.c native/pw_audio_ps5.c native/pw_pad_ps5.c native/pw_agc_ps5.c
@@ -196,6 +220,19 @@ objects+=("$build/obj/ps5log.o" "$build/obj/ps5log_ps5_net.o")
 # the whole registration if it is absent, so it is not optional.
 [[ -f $root/sce_sys/icon0.png ]] || python3 "$root/tools/make_icon.py"
 cp "$root/sce_sys/param.json" "$root/sce_sys/icon0.png" "$dist/sce_sys/"
+[[ -z $title_icon ]] || cp "$title_icon" "$dist/sce_sys/icon0.png"
+python3 - "$dist/sce_sys/param.json" "$title_id" "$title_name" <<'PY'
+import json, pathlib, sys
+path, title_id, title_name = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+param = json.loads(path.read_text(encoding="utf-8"))
+old = param["titleId"]
+param["titleId"] = title_id
+param["contentId"] = param["contentId"].replace(old, title_id)
+param["conceptId"] = title_id[4:]
+if title_name:
+    param["localizedParameters"]["en-US"]["titleName"] = title_name
+path.write_text(json.dumps(param, indent=2) + "\n", encoding="utf-8")
+PY
 cp "$foundation/runtime/libc.prx" "$dist/sce_module/libc.prx"
 cp "$lapy_helper_elf" "$dist/lapy.elf"
 # The console refuses to start a title whose eboot lacks execute permission
