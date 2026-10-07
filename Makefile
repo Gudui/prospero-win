@@ -164,6 +164,7 @@ test: $(addprefix $(BUILD)/,$(TESTS)) $(BUILD)/classify_x86 $(BUILD)/dbt_differe
 	python3 tests/test_wine_directory_changes.py
 	python3 tests/test_wine_dib_section.py
 	python3 tests/test_wow64native_scaffold.py
+	CC="$(CC)" python3 tests/test_native_wow64_provider.py
 	python3 tests/test_wowprospero_contract.py
 	CC="$(CC)" CFLAGS="$(CFLAGS)" python3 tests/test_wowprospero_unmap.py
 	CC="$(CC)" CFLAGS="$(CFLAGS)" python3 tests/test_wowprospero_service_return.py
