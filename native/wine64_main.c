@@ -946,12 +946,17 @@ int main(int argc, char **argv)
     uint64_t close_requested = 0, combo_ticks = 0, started = now_ns();
 
     /* An autostart title's game has ended and the title restarted into its
-     * launcher: go back to Home from here, before Wine is loaded. Exiting the
-     * game's own process instead raced Wine's threads (SIGSYS). A restart's
-     * argv starts with its first word (launcher=1 cycle=N gives argc 2). */
+     * launcher: go back to Home from here, before Wine is loaded. A title
+     * that calls exit() takes SIGSYS on FW 5.50 (PPSA99400 W3, with and
+     * without Wine loaded); the system's own exit is LoadExec("exit"),
+     * which returns while the system ends the process. A restart's argv
+     * starts with its first word (launcher=1 cycle=N gives argc 2). */
     if (PW_AUTOSTART_PROFILE[0] != '\0')
         for (int i = 0; i < argc; i++)
-            if (argv[i] && !strncmp(argv[i], "launcher=", 9)) return 0;
+            if (argv[i] && !strncmp(argv[i], "launcher=", 9)) {
+                sceSystemServiceLoadExec("exit", NULL);
+                for (;;) usleep(100000);
+            }
     ps5log_config_defaults(&log_config);
     if (ps5log_load_config(ps5log_default_conf_paths, ps5log_default_conf_path_count,
                            &log_config, NULL) == 0)
