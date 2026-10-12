@@ -1,0 +1,57 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: prospero-win <prospero-win@invalid>
+Date: Mon, 12 Oct 2026 09:00:00 +0200
+Subject: [PATCH] win32u: Mark the PS5 driver's extended keys as extended.
+
+The driver posts each key with the scan code the layout gives its
+virtual key. For the arrows, Home, End, Page Up/Down, Insert and Delete
+that is the keypad's scan code (VK_DOWN maps to 0x50, numpad 2), and a
+PC keyboard tells them apart only by the E0 prefix, which raw input
+carries as RI_KEY_E0 when the input has KEYEVENTF_EXTENDEDKEY. Without
+it a program that reads keys by scan code sees the keypad: Unity's Input
+System reported numpad 2 for the down arrow, so YARG's menus ignored the
+arrows from a USB keyboard on the console. Keypad /, the Windows keys and
+the menu key are extended too.
+---
+ dlls/win32u/ps5drv.c | 19 +++++++++++++++++++
+ 1 file changed, 19 insertions(+)
+
+diff --git a/dlls/win32u/ps5drv.c b/dlls/win32u/ps5drv.c
+--- a/dlls/win32u/ps5drv.c
++++ b/dlls/win32u/ps5drv.c
+@@ -532,6 +532,24 @@
+     pthread_mutex_unlock( &screen_lock );
+ }
+ 
++/* Keys a PC keyboard sends with an E0 prefix. The layout maps their
++ * virtual keys to the keypad's scan codes (VK_DOWN to 0x50, numpad 2), so
++ * without KEYEVENTF_EXTENDEDKEY raw input reports the keypad key and a
++ * program that reads keys by scan code (Unity's Input System) sees numpad 2
++ * instead of the down arrow. */
++static BOOL is_extended_key( WORD vk )
++{
++    switch (vk)
++    {
++    case VK_PRIOR: case VK_NEXT: case VK_END: case VK_HOME:
++    case VK_LEFT: case VK_UP: case VK_RIGHT: case VK_DOWN:
++    case VK_INSERT: case VK_DELETE: case VK_DIVIDE:
++    case VK_LWIN: case VK_RWIN: case VK_APPS:
++        return TRUE;
++    }
++    return FALSE;
++}
++
+ static BOOL ps5_ProcessEvents( DWORD mask )
+ {
+     static const DWORD button_flags[3][2] =
+@@ -569,6 +587,7 @@
+             input.ki.wVk = event.code;
+             input.ki.wScan = NtUserMapVirtualKeyEx( event.code, MAPVK_VK_TO_VSC, NtUserGetKeyboardLayout( 0 ));
+             input.ki.dwFlags = event.down ? 0 : KEYEVENTF_KEYUP;
++            if (is_extended_key( event.code )) input.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
+             NtUserSendHardwareInput( hwnd, 0, &input, 0 );
+             break;
+         case 2:
+-- 
+2.43.0
+
