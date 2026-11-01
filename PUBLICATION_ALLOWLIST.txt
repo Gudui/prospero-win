@@ -313,9 +313,6 @@ tests/test_pw_hid.c
 native/pw_hid_ps5.c
 native/pw_hid_ps5.h
 tests/test_pw_hid_ps5.c
-native/pw_usb_probe.c
-native/pw_usb_probe.h
-tests/test_pw_usb_probe.c
 tests/test_home_exit_loadexec.py
 native/pw_osk_ps5.c
 native/pw_osk_ps5.h
@@ -643,3 +640,14 @@ tests/test_xinput_title_slots.py
 src/pw_xinput_usb.h
 src/pw_xinput_usb.c
 tests/test_pw_xinput_usb.c
+
+native/pw_xinput_usb_freebsd.h
+native/pw_xinput_usb_freebsd.c
+tests/test_pw_xinput_usb_freebsd.c
+
+native/pw_xinput_usb_wine.h
+native/pw_xinput_usb_wine.c
+
+tests/test_pw_xinput_usb_wine.c
+
+docs/XINPUT_USB.md

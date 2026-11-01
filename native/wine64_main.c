@@ -40,7 +40,10 @@
 #include "pw_audio_ps5.h"
 #include "pw_pad_ps5.h"
 #include "pw_hid_ps5.h"
-#include "pw_usb_probe.h"
+#include "pw_xinput_usb_wine.h"
+#ifndef PW_USB360_CAPTURE
+#define PW_USB360_CAPTURE 0
+#endif
 #include "pw_osk_ps5.h"
 #include "pw_videoout_ps5.h"
 #include "pw_wine_library.h"
@@ -799,10 +802,16 @@ static void osk_log(const char *line)
     PS5LOG_LOG("PW_WINE64 osk %s", line);
 }
 
-/* Stage A of guitar support: what USB nodes the title can see (read-only). */
+/* Generic wired-360 backend and optional raw input capture. */
 static void usb_log(const char *line)
 {
     PS5LOG_LOG("PW_WINE64 usb %s", line);
+}
+
+static void usb_backend_log(void *context, const char *line)
+{
+    (void)context;
+    usb_log(line);
 }
 
 /* The process's CPU time, user and system, in milliseconds: a stall that
@@ -1058,6 +1067,7 @@ int main(int argc, char **argv)
     static PwVideoOutPs5 video;
     static PwPadPs5 pad;
     static PwHidPs5 hid;
+    static PwXinputUsbWine usb_guitars;
     static PwGameInput game_input;
     /* [input] player2: a second signed-in user's DualSense as more keys. */
     static PwPadPs5 pad2;
@@ -1094,14 +1104,12 @@ int main(int argc, char **argv)
         ps5log_init(&log_config, PW_TITLE_ID, PW_APP_NAME, now_ns());
     pw_hid_ps5_preload(hid_log);   /* before the /data grant changes the title's credentials */
     pw_osk_ps5_preload(osk_log);   /* the dialog's module is a system module too */
-    (void)pw_usb_probe_run("pre-grant", "/dev", usb_log);   /* read-only; HYP-W4A-USB-DEVFS */
     if (open_library() != 0) {
         PS5LOG_LOG("PW_WINE64 startup blocked reason=data-helper-incomplete");
         if (PW_HOME_EXIT_LOADEXEC) leave_to_home("data-helper-incomplete");
         ps5log_close("data-helper-incomplete");
         return 1;
     }
-    (void)pw_usb_probe_run("post-grant", "/dev", usb_log);
     (void)pw_wine_launch_parse(argc, argv, catalog, catalog_count, &launch);
     (void)pw_diagnostics_open(library_root, PW_BUILD_ID,
                               launch.app ? launch.app->id : "launcher", launch.cycle);
@@ -1411,9 +1419,19 @@ int main(int argc, char **argv)
     if (script_input.pad_events && !set_pad)
         PS5LOG_LOG("PW_WINE64 script pad events ignored: the profile's [input] mode is not xinput");
 #endif
+    /* The generic indexed sink is optional with an older runtime. A
+     * capture build can still qualify raw USB without claiming XInput. */
+    PwXinputUsbSetSlot set_usb_slot = NULL;
+    if (set_pad) set_usb_slot = (PwXinputUsbSetSlot)(uintptr_t)
+        pw_prx_lookup(start.descriptor, "pw_wine_set_pad_slot");
+    PwXinputUsbOps usb_ops = *pw_xinput_usb_freebsd_system_ops();
+    usb_ops.log = usb_backend_log;
+    (void)pw_xinput_usb_wine_init(&usb_guitars, &usb_ops,
+                                 PW_USB360_CAPTURE ? NULL : set_usb_slot, usb_log, PW_USB360_CAPTURE);
     for (uint64_t tick = 1; status == PW_OK; tick++) {
         uint64_t now = now_ns();
         pw_diagnostics_tick(now);
+        pw_xinput_usb_wine_poll(&usb_guitars, tick, 5 * PW_WINE64_TICKS_PER_S);
         PwPresentView view;
         PwWineInput events[2 * PW_GAME_BUTTON_COUNT + 1];
         int presented = 0;
@@ -1766,6 +1784,7 @@ int main(int argc, char **argv)
             }
         }
     }
+    pw_xinput_usb_wine_close(&usb_guitars);
     PS5LOG_LOG("PW_WINE64 done status=%d stage=%d", status, start.stage);
     if (status != PW_OK) restart_title(NULL, launch.cycle + 1u, "start-failed");
     if (PW_HOME_EXIT_LOADEXEC) leave_to_home("wine64-restart-failed");
