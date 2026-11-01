@@ -32,6 +32,7 @@ typedef struct PwXinputUsbFreebsd {
     unsigned limit;
     struct {
         int fd,has_report;
+        uint32_t empty_reads;
         PwXinputUsbNode node;
         PwXinputUsbDevice device;
     } slots[PW_XINPUT_USB_DEVICES];

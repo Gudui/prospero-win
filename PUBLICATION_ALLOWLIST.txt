@@ -653,3 +653,5 @@ tests/test_pw_xinput_usb_wine.c
 docs/XINPUT_USB.md
 
 tests/fixtures/xplorer_1430_4748.h
+
+tests/wine_xinput_guitar.c
