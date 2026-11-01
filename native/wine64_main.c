@@ -66,6 +66,9 @@
 #define PW_TITLE_ID "PPSA99995"
 #endif
 #define PW_APP_NAME "prospero-win-wine64"
+#ifndef PW_HOME_EXIT_LOADEXEC
+#define PW_HOME_EXIT_LOADEXEC 0
+#endif
 #ifndef PW_FIXED_PROFILE
 /* The id of the one profile a single-program title runs; "" for the launcher. */
 #define PW_FIXED_PROFILE ""
@@ -666,6 +669,19 @@ static PwWineLaunch launch;
  * itself. Does not return. */
 static void leave_to_home(const char *reason)
 {
+#if PW_HOME_EXIT_LOADEXEC
+    int rc;
+
+    display_quiesce(reason);
+    PS5LOG_LOG("PW_WINE64 leave method=loadexec-exit");
+    pw_diagnostics_close(reason);
+    rc = sceSystemServiceLoadExec("exit", NULL);
+    /* Success never returns. On refusal do not fall through to exit/main:
+     * that is a target-proven SIGSYS path on firmware 5.50. */
+    pw_diagnostics_resume();
+    PS5LOG_LOG("PW_WINE64 leave LoadExec exit refused rc=0x%08x", (unsigned)rc);
+    for (;;) usleep(100000);
+#else
     int app_id, rc = -1;
 
     display_quiesce(reason);
@@ -678,6 +694,7 @@ static void leave_to_home(const char *reason)
     PS5LOG_LOG("PW_WINE64 leave close rc=0x%08x: ending the process", (unsigned)rc);
     pw_diagnostics_close(reason);
     _exit(0);
+#endif
 }
 
 /* Replace this process with the title again: app's game, or the launcher

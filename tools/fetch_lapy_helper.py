@@ -6,6 +6,7 @@ import json
 import hashlib
 from pathlib import Path
 import re
+import shutil
 import sys
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -41,19 +42,49 @@ def validate_helper_manifest(manifest: dict, elf: Path, protocol: Path,
             "Lapy helper lacks required feature: root_layout_probe_retry")
 
 
+def stage_local_helper(directory: Path, output: Path, expected_sha256: str) -> None:
+    """Stage pinned local bytes; the builder still validates the wire manifest."""
+    elf, manifest = directory / "lapy.elf", directory / "lapy-manifest.json"
+    verify_pinned_elf(elf, expected_sha256)
+    json.loads(manifest.read_text(encoding="utf-8"))
+    output.mkdir(parents=True, exist_ok=True)
+    for source in (elf, manifest):
+        shutil.copyfile(source, output / source.name)
+    (output / "release.json").write_text(json.dumps({
+        "source_kind": "local-pinned-helper",
+        "source_directory": str(directory.resolve()),
+        "elf_sha256": expected_sha256.lower(),
+        "repository": None, "tag_name": None, "release_url": None,
+    }, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--repo", required=True, help="GitHub owner/repository")
-    parser.add_argument("--tag", required=True, help="the pinned release tag")
+    parser.add_argument("--repo", help="GitHub owner/repository")
+    parser.add_argument("--tag", help="the pinned release tag")
+    parser.add_argument("--local-dir", type=Path,
+                        help="pinned helper and manifest built locally, instead of a release")
     parser.add_argument("--sha256", required=True, help="the pinned lapy.elf SHA-256")
     parser.add_argument("--out", required=True, type=Path)
     args = parser.parse_args()
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", args.sha256):
+        parser.error("--sha256 must be a SHA-256 digest")
+    if args.local_dir is not None:
+        if args.repo or args.tag:
+            parser.error("--local-dir cannot be combined with --repo or --tag")
+        try:
+            stage_local_helper(args.local_dir, args.out, args.sha256)
+            print(f"Staged pinned local Lapy helper from {args.local_dir}")
+            return 0
+        except (OSError, ValueError) as error:
+            print(f"Could not stage local Lapy helper: {error}", file=sys.stderr)
+            return 1
+    if not args.repo or not args.tag:
+        parser.error("--repo and --tag are required without --local-dir")
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", args.repo):
         parser.error("--repo must be owner/repository")
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", args.tag):
         parser.error("--tag must be a release tag")
-    if not re.fullmatch(r"[0-9a-fA-F]{64}", args.sha256):
-        parser.error("--sha256 must be a SHA-256 digest")
 
     api = f"https://api.github.com/repos/{args.repo}/releases/tags/{args.tag}"
     try:

@@ -36,6 +36,11 @@
 #   PW_LAPY_RELEASE, PW_LAPY_ELF_SHA256
 #                          the /data helper's release for that title: a helper
 #                          is built for one exact title ID
+#   PW_LAPY_HELPER_DIR     local lapy.elf + lapy-manifest.json instead of a
+#                          release; requires explicit PW_LAPY_ELF_SHA256 and
+#                          passes the same title/protocol/feature validation
+#   PW_HOME_EXIT_LOADEXEC  1 uses the qualified LoadExec("exit") Home exit on
+#                          targets needing it; 0 keeps the upstream system close
 set -euo pipefail
 
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
@@ -62,9 +67,15 @@ title_name=${PW_TITLE_NAME:-}
 title_icon=${PW_TITLE_ICON:-}
 data_root=${PW_DATA_ROOT:-/data/prospero-win}
 fixed_profile=${PW_FIXED_PROFILE:-}
+local_helper=${PW_LAPY_HELPER_DIR:-}
+home_exit_loadexec=${PW_HOME_EXIT_LOADEXEC:-0}
 
 [[ $native_mode == wine64 ]] || {
     echo "PW_NATIVE_MODE must be wine64: the direct Win32 runtime was removed" >&2; exit 2; }
+[[ $home_exit_loadexec == 0 || $home_exit_loadexec == 1 ]] || {
+    echo "PW_HOME_EXIT_LOADEXEC must be 0 or 1" >&2; exit 2; }
+[[ -z $local_helper || -n ${PW_LAPY_ELF_SHA256:-} ]] || {
+    echo "PW_LAPY_HELPER_DIR requires explicit PW_LAPY_ELF_SHA256" >&2; exit 2; }
 [[ $wine64_watchdog == 0 || $wine64_watchdog == 1 ]] || {
     echo "PW_WINE64_WAIT_WATCHDOG must be 0 or 1" >&2; exit 2; }
 [[ $wine64_script == 0 || $wine64_script == 1 ]] && [[ $wine64_seconds =~ ^[0-9]+$ ]] &&
@@ -81,7 +92,7 @@ fixed_profile=${PW_FIXED_PROFILE:-}
     echo "PW_TITLE_NAME must not contain double quotes" >&2; exit 2; }
 [[ -z $title_icon || -f $title_icon ]] || {
     echo "PW_TITLE_ICON names no file" >&2; exit 2; }
-[[ $title_id == PPSA99995 || -n ${PW_LAPY_RELEASE:-} ]] || {
+[[ $title_id == PPSA99995 || -n ${PW_LAPY_RELEASE:-} || -n $local_helper ]] || {
     echo "PW_TITLE_ID needs PW_LAPY_RELEASE: the /data helper is built for one title" >&2; exit 2; }
 [[ $output_suffix =~ ^[A-Za-z0-9_-]*$ ]] || {
     echo "PW_OUTPUT_SUFFIX must contain only letters, digits, '_' or '-'" >&2
@@ -89,9 +100,14 @@ fixed_profile=${PW_FIXED_PROFILE:-}
 }
 helper_download=$(mktemp -d "${TMPDIR:-/tmp}/prospero-lapy-helper.XXXXXX")
 trap 'rm -rf -- "$helper_download"' EXIT
-python3 "$root/tools/fetch_lapy_helper.py" \
-    --repo mpereiraesaa/PS5-Lapy-JB-Daemon --tag "$lapy_release" \
-    --sha256 "$lapy_elf_sha256" --out "$helper_download"
+if [[ -n $local_helper ]]; then
+    python3 "$root/tools/fetch_lapy_helper.py" --local-dir "$local_helper" \
+        --sha256 "$lapy_elf_sha256" --out "$helper_download"
+else
+    python3 "$root/tools/fetch_lapy_helper.py" \
+        --repo mpereiraesaa/PS5-Lapy-JB-Daemon --tag "$lapy_release" \
+        --sha256 "$lapy_elf_sha256" --out "$helper_download"
+fi
 lapy_helper_elf="$helper_download/lapy.elf"
 helper_magic=$(od -An -tx1 -N4 "$lapy_helper_elf" | tr -d ' \n')
 [[ $helper_magic == 7f454c46 ]] || {
@@ -186,6 +202,7 @@ common=(-DPW_BUILD_ID=\""$build_id"\" -O2 -Wall -Wextra -Werror -ffunction-secti
         -DPW_WINE64_SCRIPT="$wine64_script" -DPW_WINE64_SECONDS="$wine64_seconds"
         -DPW_WINE64_SCRIPT_CYCLES="$wine64_cycles" -DPW_WINE64_WAIT_WATCHDOG="$wine64_watchdog"
         -DPW_TITLE_ID=\""$title_id"\" -DPW_FIXED_PROFILE=\""$fixed_profile"\"
+        -DPW_HOME_EXIT_LOADEXEC="$home_exit_loadexec"
         -DPW_WINE64_ROOT_DATA=\""$data_root"\"
         -DPW_WINE64_ROOT_SANDBOX=\""/download0/${data_root##*/}"\")
 

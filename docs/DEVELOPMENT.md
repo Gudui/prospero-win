@@ -187,6 +187,8 @@ its identity from the environment:
 | `PW_DATA_ROOT` | its data under `/data` in place of `/data/prospero-win`: `profiles/`, `prefixes/`, `logs/` |
 | `PW_FIXED_PROFILE` | the id of the profile it runs |
 | `PW_LAPY_RELEASE`, `PW_LAPY_ELF_SHA256` | the `/data` helper built for that title ID: a helper serves one exact title, so another ID needs its own release |
+| `PW_LAPY_HELPER_DIR` | alternatively stage a locally built `lapy.elf` and `lapy-manifest.json`; requires an explicit `PW_LAPY_ELF_SHA256` and the same title/protocol/feature checks as a release; provenance records local bytes, not a published release |
+| `PW_HOME_EXIT_LOADEXEC` | set `1` for a target qualified with `sceSystemServiceLoadExec("exit", NULL)`; defaults to `0` (upstream system close). A refused LoadExec is logged and waits rather than falling through to process exit |
 
 Started from the home screen, such a title starts its profile as the
 launcher would (`PW_WINE64 ... reason=fixed-profile`). Where the launcher
