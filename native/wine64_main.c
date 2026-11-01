@@ -734,6 +734,7 @@ static void on_exit_report(void)
 {
     PS5LOG_LOG("PW_WINE64 exit sink_calls=%lu", sink_calls);
     restart_title(NULL, launch.cycle + 1u, "wine-exit");
+    if (PW_HOME_EXIT_LOADEXEC) leave_to_home("wine64-exit-restart-failed");
     pw_diagnostics_close("wine64-exit");
 }
 
@@ -895,6 +896,7 @@ static void run_launcher(void)
         if (PW_WINE64_SCRIPT && tick == 3 * PW_WINE64_TICKS_PER_S) {
             if (launch.cycle >= PW_WINE64_SCRIPT_CYCLES) {
                 PS5LOG_LOG("PW_WINE64 launcher script done cycles=%u", (unsigned)launch.cycle);
+                if (PW_HOME_EXIT_LOADEXEC) leave_to_home("wine64-script-done");
                 pw_diagnostics_close("wine64-script-done");
                 _exit(0);
             }
@@ -918,6 +920,7 @@ static void run_launcher(void)
     if (pad_status == PW_OK) (void)pw_pad_ps5_close(&pad);
     if (video_status == PW_OK) (void)pw_videoout_ps5_close(&video);
     restart_title(&catalog[chosen], launch.cycle, "launcher");
+    if (PW_HOME_EXIT_LOADEXEC) leave_to_home("wine64-launch-failed");
     pw_diagnostics_close("wine64-launch-failed");
     _exit(1);
 }
