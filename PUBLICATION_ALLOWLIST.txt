@@ -313,6 +313,10 @@ tests/test_pw_hid.c
 native/pw_hid_ps5.c
 native/pw_hid_ps5.h
 tests/test_pw_hid_ps5.c
+native/pw_usb_probe.c
+native/pw_usb_probe.h
+tests/test_pw_usb_probe.c
+tests/test_home_exit_loadexec.py
 native/pw_osk_ps5.c
 native/pw_osk_ps5.h
 tests/test_pw_osk.c
