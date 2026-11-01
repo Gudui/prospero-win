@@ -40,6 +40,7 @@
 #include "pw_audio_ps5.h"
 #include "pw_pad_ps5.h"
 #include "pw_hid_ps5.h"
+#include "pw_usb_probe.h"
 #include "pw_osk_ps5.h"
 #include "pw_videoout_ps5.h"
 #include "pw_wine_library.h"
@@ -798,6 +799,12 @@ static void osk_log(const char *line)
     PS5LOG_LOG("PW_WINE64 osk %s", line);
 }
 
+/* Stage A of guitar support: what USB nodes the title can see (read-only). */
+static void usb_log(const char *line)
+{
+    PS5LOG_LOG("PW_WINE64 usb %s", line);
+}
+
 /* The process's CPU time, user and system, in milliseconds: a stall that
  * waits shows no growth, one that spins grows by a core a second. */
 static unsigned long long cpu_ms(void)
@@ -1087,12 +1094,14 @@ int main(int argc, char **argv)
         ps5log_init(&log_config, PW_TITLE_ID, PW_APP_NAME, now_ns());
     pw_hid_ps5_preload(hid_log);   /* before the /data grant changes the title's credentials */
     pw_osk_ps5_preload(osk_log);   /* the dialog's module is a system module too */
+    (void)pw_usb_probe_run("pre-grant", "/dev", usb_log);   /* read-only; HYP-W4A-USB-DEVFS */
     if (open_library() != 0) {
         PS5LOG_LOG("PW_WINE64 startup blocked reason=data-helper-incomplete");
         if (PW_HOME_EXIT_LOADEXEC) leave_to_home("data-helper-incomplete");
         ps5log_close("data-helper-incomplete");
         return 1;
     }
+    (void)pw_usb_probe_run("post-grant", "/dev", usb_log);
     (void)pw_wine_launch_parse(argc, argv, catalog, catalog_count, &launch);
     (void)pw_diagnostics_open(library_root, PW_BUILD_ID,
                               launch.app ? launch.app->id : "launcher", launch.cycle);
