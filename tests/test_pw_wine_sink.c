@@ -219,6 +219,54 @@ static void test_menu(void)
     assert(got.sequence==6 && !got.open && !got.title[0]);
 }
 
+static void test_pad_slots(void)
+{
+    PwWinePad original,pad={0},seen;
+    PwWinePadCaps caps={7,0x1430,0x4748,0x0100,0},got;
+    uint32_t left,right;
+    _Static_assert(sizeof(PwWinePad)==20,"XInput state ABI");
+    _Static_assert(sizeof(PwWinePadCaps)==12,"XInput caps ABI");
+    assert(pw_wine_pad(&original));
+    assert(pw_wine_pad_caps(0,&got) && got.subtype==1 && got.vendor_id==0x045e);
+    for(uint32_t i=1;i<PW_WINE_PAD_SLOTS;i++) {
+        assert(!pw_wine_pad_slot(i,&seen) && !pw_wine_pad_caps(i,&got));
+        pad.buttons=(uint16_t)(0x1000*i);
+        assert(!pw_wine_set_pad_slot(i,&pad,&caps));
+        assert(pw_wine_pad_slot(i,&seen) && seen.packet==1 && seen.buttons==pad.buttons);
+        assert(pw_wine_pad_caps(i,&got) && got.subtype==7 && got.product_id==0x4748 && !got.flags);
+    }
+    assert(pw_wine_pad(&seen) && seen.packet==original.packet && seen.buttons==original.buttons);
+    pad.buttons=0x2000;
+    assert(!pw_wine_set_pad_slot(2,&pad,&caps));
+    assert(pw_wine_pad_slot(2,&seen) && seen.packet==1); /* same state */
+    caps.subtype=6;
+    assert(!pw_wine_set_pad_slot(2,&pad,&caps));
+    assert(pw_wine_pad_slot(2,&seen) && seen.packet==2); /* identity changed */
+    assert(pw_wine_pad_slot(1,&seen) && seen.packet==1 && seen.buttons==0x1000);
+    pw_wine_set_rumble_slot(1,100,200); /* no FFB advertised */
+    assert(!pw_wine_rumble_slot(1,&left,&right) && !left && !right);
+    caps.flags=PW_WINE_PAD_FFB;
+    assert(!pw_wine_set_pad_slot(2,&pad,&caps));
+    pw_wine_set_rumble_slot(2,200,70000);
+    assert(pw_wine_rumble_slot(2,&left,&right) && left==200 && right==65535);
+    assert(!pw_wine_rumble_slot(3,&left,&right) && !left && !right);
+    assert(!pw_wine_set_pad_slot(2,NULL,NULL));
+    assert(!pw_wine_pad_slot(2,&seen) && !seen.connected && !seen.packet && !seen.buttons);
+    assert(!pw_wine_pad_caps(2,&got) && !got.subtype && !got.vendor_id);
+    assert(pw_wine_rumble_slot(2,&left,&right) && !left && !right); /* stop once */
+    assert(!pw_wine_rumble_slot(2,&left,&right));
+    assert(!pw_wine_set_pad_slot(2,&pad,NULL));
+    assert(pw_wine_pad_slot(2,&seen) && seen.packet==4);
+    assert(pw_wine_pad_caps(2,&got) && got.subtype==1 && got.vendor_id==0x045e);
+    assert(pw_wine_set_pad_slot(4,&pad,&caps)==-1);
+    caps.subtype=256;assert(pw_wine_set_pad_slot(1,&pad,&caps)==-1);
+    assert(!pw_wine_pad_slot(4,&seen) && !seen.connected && !pw_wine_pad_caps(4,&got));
+    assert(!pw_wine_pad_slot(0,NULL) && !pw_wine_pad_caps(0,NULL));
+    pw_wine_set_rumble_slot(4,1,2);
+    assert(!pw_wine_rumble_slot(4,&left,&right) && !left && !right);
+    for(uint32_t i=1;i<PW_WINE_PAD_SLOTS;i++)assert(!pw_wine_set_pad_slot(i,NULL,NULL));
+}
+
 int main(void)
 {
     uint32_t frame[4*3];
@@ -325,6 +373,7 @@ int main(void)
     pw_wine_set_rumble(1000,0xffff);assert(!pw_wine_rumble(NULL,NULL));  /* unchanged */
     pw_wine_set_rumble(0x10000,0);assert(pw_wine_rumble(NULL,&right)==1 && right==0);
     assert(!pw_wine_rumble(&left,NULL) && left==0xffff);
+    test_pad_slots();
     test_display_release();
     test_menu();
     return 0;

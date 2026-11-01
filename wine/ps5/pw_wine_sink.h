@@ -10,8 +10,8 @@
  * and next calls with dlsym. Frames go out through one sink, the title's
  * pw_present_frame path; input comes in through a bounded queue the title
  * fills from the DualSense and the driver drains in ProcessEvents. A
- * game's XInput controller is one more slot: the title keeps the newest
- * gamepad state in it, Wine's xinput reads it (its Unix library, patch
+ * game's XInput controllers have four slots: the title keeps their newest
+ * states and identities, Wine's xinput reads them (its Unix library, patch
  * 0470, finds these calls with dlsym) and leaves the rumble it asks for.
  * The title's in-game menu is another slot: the title stores what to draw
  * and ntdll hands it to the game's renderer (menu/pw_title_menu.h).
@@ -63,6 +63,21 @@ typedef struct PwWinePad {
     uint8_t left_trigger,right_trigger;
     int16_t thumb_lx,thumb_ly,thumb_rx,thumb_ry;
 } PwWinePad;
+
+/* Four independent XInput users. Slot 0 wrappers preserve the original ABI. */
+enum { PW_WINE_PAD_SLOTS=4, PW_WINE_PAD_FFB=1 };
+typedef struct PwWinePadCaps {
+    uint32_t subtype;        /* XINPUT_DEVSUBTYPE_* (gamepad=1, guitar=7) */
+    uint16_t vendor_id,product_id,revision,flags; /* XINPUT_CAPS_* */
+} PwWinePadCaps;
+/* NULL pad disconnects; NULL caps uses the legacy wired-pad identity.
+ * Returns -1 for an invalid slot, otherwise 0. Packet counters are per slot. */
+int pw_wine_set_pad_slot(uint32_t index,const PwWinePad *pad,const PwWinePadCaps *caps);
+int pw_wine_pad_slot(uint32_t index,PwWinePad *pad);
+int pw_wine_pad_caps(uint32_t index,PwWinePadCaps *caps);
+void pw_wine_set_rumble_slot(uint32_t index,uint32_t left,uint32_t right);
+/* Disconnecting clears requested motors and delivers that stop once. */
+int pw_wine_rumble_slot(uint32_t index,uint32_t *left,uint32_t *right);
 
 /* Title side. */
 void pw_wine_set_present_sink(PwWinePresentSink sink,void *context);
