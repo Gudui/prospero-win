@@ -1086,6 +1086,7 @@ int main(int argc, char **argv)
     pw_osk_ps5_preload(osk_log);   /* the dialog's module is a system module too */
     if (open_library() != 0) {
         PS5LOG_LOG("PW_WINE64 startup blocked reason=data-helper-incomplete");
+        if (PW_HOME_EXIT_LOADEXEC) leave_to_home("data-helper-incomplete");
         ps5log_close("data-helper-incomplete");
         return 1;
     }
@@ -1100,6 +1101,7 @@ int main(int argc, char **argv)
         for (uint32_t i = 0; i < catalog_count; i++)
             if (!strcmp(catalog[i].id, fixed_profile)) restart_title(&catalog[i], launch.cycle, "fixed-profile");
         PS5LOG_LOG("PW_WINE64 startup blocked reason=no-fixed-profile profile=%s", fixed_profile);
+        if (PW_HOME_EXIT_LOADEXEC) leave_to_home("no-fixed-profile");
         ps5log_close("no-fixed-profile");
         return 1;
     }
@@ -1136,6 +1138,7 @@ int main(int argc, char **argv)
             extra[config.extra_env_count++] = (PwWineStartEnv){ "WINEDLLOVERRIDES", effective_dll_overrides };
         else if (overrides_status != PW_OK) {
             PS5LOG_LOG("PW_WINE64 DLL overrides refused: %s", game->app.id);
+            if (PW_HOME_EXIT_LOADEXEC) leave_to_home("dll-overrides-refused");
             return 1;
         }
         {
@@ -1157,7 +1160,10 @@ int main(int argc, char **argv)
             }
             PS5LOG_LOG("PW_WINE64 zink provider=%s copied=%u architecture=%s", pw_result_name(provider_status),
                        copied, game->app.architecture == PW_APP_ARCH_PE32 ? "pe32" : "pe64");
-            if (provider_status != PW_OK) return 1;
+            if (provider_status != PW_OK) {
+                if (PW_HOME_EXIT_LOADEXEC) leave_to_home("zink-provider-refused");
+                return 1;
+            }
         }
         /* xinput mode: SDL2 games (Half-Life) look for controllers through
          * raw input first, which Wine on the PS5 has none of, and then skip
@@ -1750,6 +1756,7 @@ int main(int argc, char **argv)
     }
     PS5LOG_LOG("PW_WINE64 done status=%d stage=%d", status, start.stage);
     if (status != PW_OK) restart_title(NULL, launch.cycle + 1u, "start-failed");
+    if (PW_HOME_EXIT_LOADEXEC) leave_to_home("wine64-restart-failed");
     pw_diagnostics_close(status == PW_OK ? "wine64-restart-failed" : "wine64-start-failed");
     _exit(1);
 }
