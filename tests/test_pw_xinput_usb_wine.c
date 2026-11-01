@@ -4,7 +4,7 @@
 #include <errno.h>
 #include <string.h>
 
-static int pending,button=0x11,logs,disconnected;
+static int pending,button=0x11,logs,disconnected,jitter,axis=-32768;
 static int enumerate(void *ctx,PwXinputUsbNode *nodes,size_t cap)
 {
     (void)ctx;assert(cap>=2);
@@ -30,7 +30,7 @@ static ssize_t read_report(void *ctx,int fd,uint8_t *out,size_t len)
     (void)ctx;assert(fd==101 && len==64);
     if(disconnected)return -ENXIO;
     if(!pending)return -EAGAIN;
-    pending--;memset(out,0,20);out[1]=20;out[2]=(uint8_t)button;out[3]=0x90;out[10]=0;out[11]=0x80;
+    pending--;memset(out,0,20);out[1]=20;out[2]=(uint8_t)button;out[3]=(uint8_t)((0x9000|button)>>8);out[4]=(uint8_t)(120+jitter);out[12]=(uint8_t)(200+jitter);out[10]=(uint8_t)axis;out[11]=(uint8_t)((uint16_t)axis>>8);
     return 20;
 }
 static void close_fd(void *ctx,int fd){(void)ctx;assert(fd==100 || fd==101);}
@@ -61,6 +61,27 @@ int main(void)
     assert(logs==1 && !pw_wine_pad_slot(1,&got)); /* capture does not inject */
     pending=1;pw_xinput_usb_wine_poll(&bridge,2,300);assert(logs==1);
     button=0x33;pending=1;pw_xinput_usb_wine_poll(&bridge,3,300);assert(logs==2);
+    assert(pw_wine_pad(&got) && got.buttons==0x2000);
+    /* Thousands of idle transfers must not spend the button budget. */
+    for(unsigned i=0;i<2000;i++) {
+        jitter=(int)(i%3);pending=1;pw_xinput_usb_wine_poll(&bridge,4+i,0);
+    }
+    assert(logs==2 && bridge.button_records[0]==1 && bridge.analog_records[0]==1);
+    for(unsigned bit=0;bit<16;bit++) {
+        button=(int)(1u<<bit);pending=1;pw_xinput_usb_wine_poll(&bridge,2100+bit,0);
+    }
+    assert(logs==18 && bridge.button_records[0]==17 && !pw_wine_pad_slot(1,&got));
+    /* Slow movement is compared to last LOGGED analog, not each noisy packet. */
+    int before=logs;
+    for(axis=-32768;axis<=32700;axis+=512) {
+        pending=1;pw_xinput_usb_wine_poll(&bridge,2200,0);
+    }
+    assert(logs>before && bridge.analog_records[0]>1);
+    /* An exhausted analog channel cannot consume button evidence. */
+    bridge.analog_records[0]=256;axis=-32768;pending=1;pw_xinput_usb_wine_poll(&bridge,2300,0);
+    assert(bridge.analog_records[0]==257);
+    before=logs;button=0x40;pending=1;pw_xinput_usb_wine_poll(&bridge,2301,0);
+    assert(logs==before+1 && bridge.button_records[0]==18);
     assert(pw_wine_pad(&got) && got.buttons==0x2000);
     pw_xinput_usb_wine_close(&bridge);
     assert(!pw_xinput_usb_wine_init(&bridge,&ops,NULL,log_line,0) && !bridge.usb.limit);

@@ -28,8 +28,10 @@ No new worker thread is started. Guitar output/rumble is not implemented and the
 USB users advertise no force-feedback capability. Without the indexed runtime
 exports, normal USB injection remains disabled.
 
-PW_USB360_CAPTURE=1 builds a diagnostic raw-input capture: up to 256 changed
-reports per device are logged as hexadecimal, with no USB XInput injection.
+PW_USB360_CAPTURE=1 builds a diagnostic raw-input capture: button transitions and significant analog movements are logged as hexadecimal
+with independent 256-record budgets and explicit limit markers. Idle analog jitter
+cannot spend the button budget. Capture selection never changes the delivered
+state. This mode has no USB XInput injection.
 This mode can qualify interrupt input against the existing Wine runtime before
 rebuilding its PE/Unix XInput modules. It is not a gameplay qualification.
 

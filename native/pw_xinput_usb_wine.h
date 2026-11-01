@@ -8,7 +8,7 @@ typedef struct PwXinputUsbWine {
     PwXinputUsbFreebsd usb;
     PwXinputUsbSetSlot set_slot;
     void (*log)(const char *);
-    unsigned capture,records[3];
+    unsigned capture,records[3],button_records[3],analog_records[3];
     PwXinputUsbState last[3];
 } PwXinputUsbWine;
 /* DualSense remains slot 0. USB users occupy stable slots 1..3 only.

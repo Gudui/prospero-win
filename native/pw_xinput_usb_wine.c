@@ -3,6 +3,17 @@
 #include <stdio.h>
 #include <string.h>
 
+/* Capture selection only. The sink above this diagnostic still receives
+ * every unmodified report. Compare analogs to the last logged sample so
+ * gradual movement accumulates, while small idle jitter costs no records. */
+static int delta(int a,int b,int step) { return a-b>=step || b-a>=step; }
+static int analog_changed(const PwXinputUsbState *a,const PwXinputUsbState *b)
+{
+    return delta(a->left_trigger,b->left_trigger,32) || delta(a->right_trigger,b->right_trigger,32) ||
+           delta(a->thumb_lx,b->thumb_lx,4096) || delta(a->thumb_ly,b->thumb_ly,4096) ||
+           delta(a->thumb_rx,b->thumb_rx,4096) || delta(a->thumb_ry,b->thumb_ry,4096);
+}
+
 static void report(void *context,unsigned slot,const PwXinputUsbDevice *device,
                     const PwXinputUsbState *state,const uint8_t *raw)
 {
@@ -22,18 +33,32 @@ static void report(void *context,unsigned slot,const PwXinputUsbDevice *device,
             char line[64];snprintf(line,sizeof(line),"usb360 disconnected xinput=%u",slot+1);bridge->log(line);
         }
         bridge->records[slot]=0;
+        bridge->button_records[slot]=bridge->analog_records[slot]=0;
         memset(&bridge->last[slot],0,sizeof(bridge->last[slot]));
         return;
     }
-    if(bridge->capture && bridge->log && bridge->records[slot]<256 &&
-       (!bridge->records[slot] || memcmp(&bridge->last[slot],state,sizeof(*state)))) {
-        char line[160],hex[2*PW_XINPUT_USB_REPORT+1];
-        for(unsigned i=0;i<PW_XINPUT_USB_REPORT;i++)snprintf(hex+2*i,3,"%02x",raw[i]);
-        snprintf(line,sizeof(line),"usb360 report xinput=%u vid=%04x pid=%04x subtype=%u bytes=%s",
-                 slot+1,device->vendor_id,device->product_id,device->subtype,hex);
-        bridge->log(line);bridge->records[slot]++;
+    if(bridge->capture && bridge->log) {
+        int initial=!bridge->records[slot];
+        int buttons=!initial && bridge->last[slot].buttons!=state->buttons;
+        int analogs=!initial && !buttons && analog_changed(&bridge->last[slot],state);
+        unsigned *budget=buttons?&bridge->button_records[slot]:&bridge->analog_records[slot];
+        if((initial || buttons || analogs) && *budget<=256) {
+            char line[192];
+            if(*budget==256) {
+                snprintf(line,sizeof(line),"usb360 capture limit xinput=%u channel=%s",slot+1,buttons?"buttons":"analog");
+                bridge->log(line);(*budget)++;
+            } else {
+                char hex[2*PW_XINPUT_USB_REPORT+1];
+                for(unsigned i=0;i<PW_XINPUT_USB_REPORT;i++)snprintf(hex+2*i,3,"%02x",raw[i]);
+                snprintf(line,sizeof(line),"usb360 report xinput=%u vid=%04x pid=%04x subtype=%u change=%s bytes=%s",
+                         slot+1,device->vendor_id,device->product_id,device->subtype,
+                         initial?"initial":buttons?"buttons":"analog",hex);
+                bridge->log(line);bridge->records[slot]++;(*budget)++;
+            }
+            bridge->last[slot]=*state;
+        }
+        if(buttons)bridge->last[slot].buttons=state->buttons;
     }
-    bridge->last[slot]=*state;
 }
 int pw_xinput_usb_wine_init(PwXinputUsbWine *bridge,const PwXinputUsbOps *ops,PwXinputUsbSetSlot set_slot,
                             void (*log)(const char *),int capture)

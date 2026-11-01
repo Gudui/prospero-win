@@ -11,7 +11,7 @@
 #                          and verifies its artifacts instead of rebuilding
 #                          its dependencies, which would mutate a tree the
 #                          laboratory's other projects share (default 0)
-#   PW_USB360_CAPTURE     1 logs up to 256 changed raw wired-360 reports per device (default 0)
+#   PW_USB360_CAPTURE     1 captures raw wired-360 controls with separate button/analog budgets (default 0)
 #   PW_NATIVE_MODE         wine64, the only mode (accepted for older scripts)
 #   PW_OUTPUT_SUFFIX       isolated build/dist suffix, e.g. -wine-smoke
 #   PW_WINE64_SCRIPT       1 drives the launcher unattended (validation)
