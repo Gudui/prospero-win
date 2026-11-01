@@ -639,3 +639,7 @@ wine/patches/0982-ntdll-ps5-high-area-as-large-as-the-kernel-grants.patch
 tests/test_wine_mouse_wheel.py
 
 tests/test_xinput_title_slots.py
+
+src/pw_xinput_usb.h
+src/pw_xinput_usb.c
+tests/test_pw_xinput_usb.c
