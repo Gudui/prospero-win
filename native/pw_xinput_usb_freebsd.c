@@ -181,7 +181,11 @@ void pw_xinput_usb_freebsd_poll(PwXinputUsbFreebsd *usb)
             PwXinputUsbState state;
             ssize_t n=usb->ops.read(usb->ops.context,usb->slots[slot].fd,data,sizeof(data));
             if(n==-EAGAIN || n==-EWOULDBLOCK || n==-EINTR)break;
-            if(n<=0 || (size_t)n>sizeof(data)) {
+            /* A USB transfer may contain zero bytes. It is not a devfs
+             * disconnect: preserve the newest state and wait for a later
+             * poll. Removal is a real read error or a missing scanned node. */
+            if(n==0)break;
+            if(n<0 || (size_t)n>sizeof(data)) {
                 if(usb->ops.log) {
                     char line[96];snprintf(line,sizeof(line),"usb360 read stopped slot=%u result=%ld",slot,(long)n);
                     usb->ops.log(usb->ops.context,line);

@@ -105,9 +105,16 @@ int main(void)
     f.short_error=0;assert(!pw_xinput_usb_freebsd_scan(&usb) && usb.slots[1].fd==131);
     f.pending[1]=1;pw_xinput_usb_freebsd_poll(&usb);assert(f.seen_slot==1);
     f.devices=1;assert(!pw_xinput_usb_freebsd_scan(&usb) && usb.slots[1].fd==-1 && f.disconnects==2);
-    f.mode[0]=5;pw_xinput_usb_freebsd_poll(&usb);assert(usb.slots[0].fd==-1 && f.disconnects==3);
-    f.mode[0]=6;assert(!pw_xinput_usb_freebsd_scan(&usb));pw_xinput_usb_freebsd_poll(&usb);
-    assert(usb.slots[0].fd==-1 && f.disconnects==3); /* no valid report after reopen */
+    int closed=f.closed,reports=f.reports;
+    f.mode[0]=5;pw_xinput_usb_freebsd_poll(&usb);
+    assert(usb.slots[0].fd==121 && f.disconnects==2 && f.closed==closed && f.reports==reports);
+    f.mode[0]=0;f.pending[0]=1;pw_xinput_usb_freebsd_poll(&usb);
+    assert(usb.slots[0].fd==121 && f.reports==reports+1); /* stream resumes without reopening */
+    f.mode[0]=6;pw_xinput_usb_freebsd_poll(&usb);
+    assert(usb.slots[0].fd==-1 && f.disconnects==3); /* impossible oversized result is an error */
+    f.mode[0]=0;assert(!pw_xinput_usb_freebsd_scan(&usb));
+    f.devices=0;assert(!pw_xinput_usb_freebsd_scan(&usb) && usb.slots[0].fd==-1);
+    assert(f.disconnects==3); /* no report was delivered after this reopen */
     pw_xinput_usb_freebsd_close(&usb);pw_xinput_usb_freebsd_close(&usb);
     assert(pw_xinput_usb_freebsd_scan(&usb)==-EINVAL);
     assert(pw_xinput_usb_freebsd_system_ops()->open_read!=NULL);

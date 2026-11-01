@@ -2,6 +2,7 @@
 #include "../src/pw_xinput_usb.h"
 #include <assert.h>
 #include <string.h>
+#include "fixtures/xplorer_1430_4748.h"
 
 int main(void)
 {
@@ -45,5 +46,10 @@ int main(void)
     report[0]=1;assert(!pw_xinput_usb_report(report,20,&state));report[0]=0;
     report[1]=19;assert(!pw_xinput_usb_report(report,20,&state));
     assert(!pw_xinput_usb_report(NULL,20,&state) && !pw_xinput_usb_report(report,20,NULL));
+    for(unsigned i=0;i<sizeof(xplorer_capture)/sizeof(xplorer_capture[0]);i++) {
+        assert(pw_xinput_usb_report(xplorer_capture[i].data,20,&state));
+        assert(state.buttons==xplorer_capture[i].buttons);
+        assert(state.thumb_rx==xplorer_capture[i].whammy && state.thumb_ry==xplorer_capture[i].tilt);
+    }
     return 0;
 }

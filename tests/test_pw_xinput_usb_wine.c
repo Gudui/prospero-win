@@ -4,7 +4,7 @@
 #include <errno.h>
 #include <string.h>
 
-static int pending,button=0x11,logs,disconnected,jitter,axis=-32768;
+static int pending,button=0x11,logs,disconnected,jitter,empty,axis=-32768;
 static int enumerate(void *ctx,PwXinputUsbNode *nodes,size_t cap)
 {
     (void)ctx;assert(cap>=2);
@@ -29,6 +29,7 @@ static ssize_t read_report(void *ctx,int fd,uint8_t *out,size_t len)
 {
     (void)ctx;assert(fd==101 && len==64);
     if(disconnected)return -ENXIO;
+    if(empty)return 0;
     if(!pending)return -EAGAIN;
     pending--;memset(out,0,20);out[1]=20;out[2]=(uint8_t)button;out[3]=(uint8_t)((0x9000|button)>>8);out[4]=(uint8_t)(120+jitter);out[12]=(uint8_t)(200+jitter);out[10]=(uint8_t)axis;out[11]=(uint8_t)((uint16_t)axis>>8);
     return 20;
@@ -52,7 +53,11 @@ int main(void)
     assert(pw_wine_pad_slot(1,&got) && got.packet==1);
     button=0x22;pending=1;pw_xinput_usb_wine_poll(&bridge,3,300);
     assert(pw_wine_pad_slot(1,&got) && got.packet==2 && got.buttons==0x9022);
-    disconnected=1;pw_xinput_usb_wine_poll(&bridge,4,300);
+    empty=1;pw_xinput_usb_wine_poll(&bridge,4,300);
+    assert(pw_wine_pad_slot(1,&got) && got.packet==2 && got.buttons==0x9022 && !logs);
+    empty=0;button=0x44;pending=1;pw_xinput_usb_wine_poll(&bridge,5,300);
+    assert(pw_wine_pad_slot(1,&got) && got.packet==3 && got.buttons==0x9044);
+    disconnected=1;pw_xinput_usb_wine_poll(&bridge,6,300);
     assert(!pw_wine_pad_slot(1,&got) && logs==1);
     pw_xinput_usb_wine_close(&bridge);
     disconnected=0;logs=0;

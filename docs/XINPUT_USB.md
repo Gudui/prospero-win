@@ -23,7 +23,9 @@ own target qualification; FreeBSD source alone is not proof of firmware behavior
 
 The title bridge reserves user 0 for the DualSense and uses users 1..3 for USB
 controllers. It scans every five seconds, drains at most eight transfers per user
-per poll, connects a user only after a valid report and clears it on disconnect.
+per poll, connects a user only after a valid report and clears it on a real read error
+or missing devfs node. Empty USB transfers preserve the current state and do
+not reconnect or reset packet numbering.
 No new worker thread is started. Guitar output/rumble is not implemented and the
 USB users advertise no force-feedback capability. Without the indexed runtime
 exports, normal USB injection remains disabled.
