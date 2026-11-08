@@ -15,7 +15,7 @@ index.
 ---
 
 diff --git a/dlls/xinput1_3/main.c b/dlls/xinput1_3/main.c
-index 7e30ada..b14578e 100644
+index 7e30ada..7349be8 100644
 --- a/dlls/xinput1_3/main.c
 +++ b/dlls/xinput1_3/main.c
 @@ -142,11 +142,68 @@ static BOOL has_title_pad(void)
@@ -133,7 +133,49 @@ index 7e30ada..b14578e 100644
  }
  
  static const int JS_STATE_OFF = 0;
-@@ -1215,6 +1272,7 @@ DWORD WINAPI DECLSPEC_HOTPATCH XInputGetCapabilities(DWORD index, DWORD flags, X
+@@ -1087,7 +1144,7 @@ static BOOL trigger_is_on(const BYTE value)
+     return value > 30;
+ }
+ 
+-static DWORD check_for_keystroke(const DWORD index, XINPUT_KEYSTROKE *keystroke)
++static DWORD check_for_keystroke(const DWORD index, XINPUT_KEYSTROKE *keystroke, const void *caller)
+ {
+     static XINPUT_GAMEPAD last_state[XUSER_MAX_COUNT];
+     static SRWLOCK keystroke_lock = SRWLOCK_INIT;
+@@ -1120,7 +1177,7 @@ static DWORD check_for_keystroke(const DWORD index, XINPUT_KEYSTROKE *keystroke)
+         /* note: guide button does not send an event */
+     };
+ 
+-    if ((ret = xinput_get_state(index, &state))) return ret;
++    if ((ret = xinput_get_state(index, &state, caller))) return ret;
+     AcquireSRWLockExclusive(&keystroke_lock);
+ 
+     cur = &state.Gamepad;
+@@ -1194,6 +1251,8 @@ done:
+ 
+ DWORD WINAPI DECLSPEC_HOTPATCH XInputGetKeystroke(DWORD index, DWORD reserved, PXINPUT_KEYSTROKE keystroke)
+ {
++    const void *caller = __builtin_return_address(0);
++
+     TRACE("index %lu, reserved %lu, keystroke %p.\n", index, reserved, keystroke);
+ 
+     if (index >= XUSER_MAX_COUNT && index != XUSER_INDEX_ANY) return ERROR_BAD_ARGUMENTS;
+@@ -1202,12 +1261,12 @@ DWORD WINAPI DECLSPEC_HOTPATCH XInputGetKeystroke(DWORD index, DWORD reserved, P
+     {
+         int i;
+         for (i = 0; i < XUSER_MAX_COUNT; ++i)
+-            if (check_for_keystroke(i, keystroke) == ERROR_SUCCESS)
++            if (check_for_keystroke(i, keystroke, caller) == ERROR_SUCCESS)
+                 return ERROR_SUCCESS;
+         return ERROR_EMPTY;
+     }
+ 
+-    return check_for_keystroke(index, keystroke);
++    return check_for_keystroke(index, keystroke, caller);
+ }
+ 
+ DWORD WINAPI DECLSPEC_HOTPATCH XInputGetCapabilities(DWORD index, DWORD flags, XINPUT_CAPABILITIES *capabilities)
+@@ -1215,6 +1274,7 @@ DWORD WINAPI DECLSPEC_HOTPATCH XInputGetCapabilities(DWORD index, DWORD flags, X
      XINPUT_CAPABILITIES_EX caps_ex;
      DWORD ret;
  
@@ -141,7 +183,7 @@ index 7e30ada..b14578e 100644
      ret = XInputGetCapabilitiesEx(1, index, flags, &caps_ex);
  
      if (!ret) *capabilities = caps_ex.Capabilities;
-@@ -1233,7 +1291,7 @@ DWORD WINAPI DECLSPEC_HOTPATCH XInputGetDSoundAudioDeviceGuids(DWORD index, GUID
+@@ -1233,7 +1293,7 @@ DWORD WINAPI DECLSPEC_HOTPATCH XInputGetDSoundAudioDeviceGuids(DWORD index, GUID
      if (has_title_pad())
      {
          XINPUT_STATE state;
@@ -150,7 +192,7 @@ index 7e30ada..b14578e 100644
      }
  
      EnterCriticalSection(&xinput_cs);
-@@ -1254,7 +1312,7 @@ DWORD WINAPI DECLSPEC_HOTPATCH XInputGetBatteryInformation(DWORD index, BYTE typ
+@@ -1254,7 +1314,7 @@ DWORD WINAPI DECLSPEC_HOTPATCH XInputGetBatteryInformation(DWORD index, BYTE typ
      if (has_title_pad())
      {
          XINPUT_STATE state;
@@ -159,7 +201,7 @@ index 7e30ada..b14578e 100644
      }
  
      EnterCriticalSection(&xinput_cs);
-@@ -1278,7 +1336,7 @@ DWORD WINAPI DECLSPEC_HOTPATCH XInputGetCapabilitiesEx(DWORD unk, DWORD index, D
+@@ -1278,7 +1338,7 @@ DWORD WINAPI DECLSPEC_HOTPATCH XInputGetCapabilitiesEx(DWORD unk, DWORD index, D
          struct xinput_caps_params params = {0};
  
          if (index >= XUSER_MAX_COUNT) return ERROR_BAD_ARGUMENTS;

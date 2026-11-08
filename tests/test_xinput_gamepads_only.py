@@ -117,9 +117,11 @@ def main():
     start = main_added.index("/* WINE_PS5_XINPUT_GAMEPADS_ONLY")
     end = main_added.index("static BOOL title_pad_state(")
     block = main_added[start:end]
-    # Every title export passes its own caller: SetState, GetState(Ex), the
-    # DSound GUIDs, battery, GetCapabilities and GetCapabilitiesEx.
-    assert main_added.count("__builtin_return_address(0)") == 7, main_added.count("__builtin_return_address(0)")
+    # Every title export passes its own caller: SetState, GetState(Ex),
+    # GetKeystroke, the DSound GUIDs, battery, GetCapabilities and
+    # GetCapabilitiesEx.
+    assert main_added.count("__builtin_return_address(0)") == 8, main_added.count("__builtin_return_address(0)")
+    assert "check_for_keystroke(index, keystroke, caller)" in main_added
     assert "if (title_pad_hidden(index, caller)) return FALSE;" in main_added
     assert "static DWORD xinput_get_state(DWORD index, XINPUT_STATE *state, const void *caller)" in main_added
     with tempfile.TemporaryDirectory(prefix="pw-xinput-gamepads-") as directory:
