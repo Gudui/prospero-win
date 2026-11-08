@@ -41,6 +41,7 @@
 #include "pw_pad_ps5.h"
 #include "pw_hid_ps5.h"
 #include "pw_xinput_usb_wine.h"
+#include "pw_xinput_net_wine.h"
 #ifndef PW_USB360_CAPTURE
 #define PW_USB360_CAPTURE 0
 #endif
@@ -808,6 +809,11 @@ static void usb_log(const char *line)
     PS5LOG_LOG("PW_WINE64 usb %s", line);
 }
 
+static void net_xinput_log(const char *line)
+{
+    PS5LOG_LOG("PW_WINE64 %s", line);
+}
+
 static void usb_backend_log(void *context, const char *line)
 {
     (void)context;
@@ -1068,6 +1074,7 @@ int main(int argc, char **argv)
     static PwPadPs5 pad;
     static PwHidPs5 hid;
     static PwXinputUsbWine usb_guitars;
+    static PwXinputNetWine net_guitars;
     static PwGameInput game_input;
     /* [input] player2: a second signed-in user's DualSense as more keys. */
     static PwPadPs5 pad2;
@@ -1428,10 +1435,19 @@ int main(int argc, char **argv)
     usb_ops.log = usb_backend_log;
     (void)pw_xinput_usb_wine_init(&usb_guitars, &usb_ops,
                                  PW_USB360_CAPTURE ? NULL : set_usb_slot, usb_log, PW_USB360_CAPTURE);
+    /* Controllers another process describes over loopback UDP (a Wii Remote
+     * guitar from PadBridge PS5): XInput slots beside the USB ones. */
+    PwXinputNetPadSlot net_pad_slot = NULL;
+    if (set_usb_slot) net_pad_slot = (PwXinputNetPadSlot)(uintptr_t)
+        pw_prx_lookup(start.descriptor, "pw_wine_pad_slot");
+    (void)pw_xinput_net_wine_init(&net_guitars, pw_xinput_net_ps5_ops(),
+                                  PW_USB360_CAPTURE || !net_pad_slot ? NULL : set_usb_slot,
+                                  net_pad_slot, net_xinput_log);
     for (uint64_t tick = 1; status == PW_OK; tick++) {
         uint64_t now = now_ns();
         pw_diagnostics_tick(now);
         pw_xinput_usb_wine_poll(&usb_guitars, tick, 5 * PW_WINE64_TICKS_PER_S);
+        pw_xinput_net_wine_poll(&net_guitars, now / 1000000u);
         PwPresentView view;
         PwWineInput events[2 * PW_GAME_BUTTON_COUNT + 1];
         int presented = 0;
@@ -1785,6 +1801,7 @@ int main(int argc, char **argv)
         }
     }
     pw_xinput_usb_wine_close(&usb_guitars);
+    pw_xinput_net_wine_close(&net_guitars);
     PS5LOG_LOG("PW_WINE64 done status=%d stage=%d", status, start.stage);
     if (status != PW_OK) restart_title(NULL, launch.cycle + 1u, "start-failed");
     if (PW_HOME_EXIT_LOADEXEC) leave_to_home("wine64-restart-failed");

@@ -650,6 +650,13 @@ native/pw_xinput_usb_wine.h
 native/pw_xinput_usb_wine.c
 
 tests/test_pw_xinput_usb_wine.c
+src/pw_xinput_net.h
+src/pw_xinput_net.c
+tests/test_pw_xinput_net.c
+native/pw_xinput_net_wine.h
+native/pw_xinput_net_wine.c
+native/pw_xinput_net_ps5.c
+tests/test_pw_xinput_net_wine.c
 
 docs/XINPUT_USB.md
 
