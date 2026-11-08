@@ -36,6 +36,13 @@
  *   r2 = mouse_left        ;            mouse_middle | vk:0xNN | none
  *   player2 = pinball-p2   ; a keyboard preset for a second DualSense, the pad
  *                          ; of another signed-in user (local multiplayer)
+ *   xinput_gamepads_only = UnityPlayer.dll
+ *                          ; xinput mode: calls from this module see only
+ *                          ; gamepads, not guitars or drums (patch 0471,
+ *                          ; WINE_PS5_XINPUT_GAMEPADS_ONLY). For Unity 2022.2+
+ *                          ; games whose plugins read those (YARG's HIDrogen),
+ *                          ; which would otherwise get each one twice;
+ *                          ; profile only, a DLL file name
  *
  *   [debug]
  *   winedebug = +seh,+virtual   ; Wine's debug channels for this game (default:
@@ -79,6 +86,7 @@
 #include <stdint.h>
 
 enum {
+    PW_GAME_MODULE_CAPACITY = 64,       /* xinput_gamepads_only: a DLL name and its NUL */
     PW_GAME_BUTTON_COUNT = 17,
     PW_GAME_DESKTOP_MIN_W = 320, PW_GAME_DESKTOP_MIN_H = 200,
     PW_GAME_DESKTOP_MAX_W = 3840, PW_GAME_DESKTOP_MAX_H = 2160,
@@ -108,6 +116,7 @@ typedef struct PwGameInput {
     PwGameBinding bindings[PW_GAME_BUTTON_COUNT];   /* in PW_GAME_BUTTON order */
     char preset[PW_APP_ID_CAPACITY];
     char player2[PW_APP_ID_CAPACITY];   /* the second pad's preset, profile only */
+    char xinput_gamepads_only[PW_GAME_MODULE_CAPACITY];  /* a module seeing only gamepads */
     uint32_t set;       /* which of mode/mouse/mouse_speed a file set (overlay) */
 } PwGameInput;
 

@@ -1,0 +1,173 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: prospero-win <prospero-win@invalid>
+Date: Sun, 8 Nov 2026 12:00:00 +0100
+Subject: [PATCH] xinput: Let one module see only gamepads.
+
+With WINE_PS5_XINPUT_GAMEPADS_ONLY=UnityPlayer.dll, calls made from that
+module see the title's gamepads but not its guitars or drums; calls from
+anywhere else see every controller. On Windows, Unity 2022.2 and later
+read gamepads through Windows.Gaming.Input and leave other XInput
+controllers to plugins such as HIDrogen. A PS5 title has no
+Windows.Gaming.Input, Unity falls back to XInput, and each guitar reached
+the game twice. The first controller hidden this way is logged once per
+index.
+
+---
+
+diff --git a/dlls/xinput1_3/main.c b/dlls/xinput1_3/main.c
+index 7e30ada..b14578e 100644
+--- a/dlls/xinput1_3/main.c
++++ b/dlls/xinput1_3/main.c
+@@ -142,11 +142,68 @@ static BOOL has_title_pad(void)
+     return title_pad != 0;
+ }
+ 
+-static BOOL title_pad_state(DWORD index, XINPUT_STATE *state)
++/* WINE_PS5_XINPUT_GAMEPADS_ONLY names a module, such as UnityPlayer.dll,
++ * whose own calls see only gamepads. On Windows, Unity 2022.2 and later
++ * read gamepads through Windows.Gaming.Input, which leaves guitars and
++ * drums to the game's plugins (HIDrogen reads them through XInput). A PS5
++ * title runs without Windows.Gaming.Input, so Unity falls back to XInput,
++ * and each guitar would reach the game twice: once from Unity and once from
++ * the plugin. Calls from anywhere else see every controller. */
++static WCHAR engine_name[64];
++static volatile ULONG_PTR engine_base, engine_end;
++static LONG engine_hid_logged[XUSER_MAX_COUNT];
++
++static BOOL WINAPI find_engine_name(INIT_ONCE *once, void *param, void **context)
++{
++    DWORD length = GetEnvironmentVariableW(L"WINE_PS5_XINPUT_GAMEPADS_ONLY", engine_name, ARRAY_SIZE(engine_name));
++
++    if (!length || length >= ARRAY_SIZE(engine_name)) engine_name[0] = 0;
++    else MESSAGE("xinput: calls from %s see only gamepads\n", debugstr_w(engine_name));
++    return TRUE;
++}
++
++static BOOL from_engine(const void *caller)
++{
++    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
++    ULONG_PTR base;
++
++    InitOnceExecuteOnce(&once, find_engine_name, NULL, NULL);
++    if (!engine_name[0]) return FALSE;
++    if (!(base = engine_base))
++    {
++        HMODULE module = GetModuleHandleW(engine_name);
++        IMAGE_NT_HEADERS *nt;
++
++        if (!module || !(nt = RtlImageNtHeader(module))) return FALSE;
++        engine_end = (ULONG_PTR)module + nt->OptionalHeader.SizeOfImage;
++        MemoryBarrier();
++        engine_base = base = (ULONG_PTR)module;
++    }
++    return (ULONG_PTR)caller >= base && (ULONG_PTR)caller < engine_end;
++}
++
++/* A controller that is there but not a gamepad, asked about from the module
++ * that sees only gamepads. */
++static BOOL title_pad_hidden(DWORD index, const void *caller)
++{
++    struct xinput_caps_params params = {0};
++
++    if (index >= XUSER_MAX_COUNT || !from_engine(caller)) return FALSE;
++    params.index = index;
++    if (__wine_unix_call(title_pad, unix_pad_caps, &params)) return FALSE;
++    if (params.caps.subtype == XINPUT_DEVSUBTYPE_GAMEPAD) return FALSE;
++    if (!InterlockedExchange(&engine_hid_logged[index], 1))
++        MESSAGE("xinput: controller %lu (subtype %u) is not reported to %s\n", index,
++                params.caps.subtype, debugstr_w(engine_name));
++    return TRUE;
++}
++
++static BOOL title_pad_state(DWORD index, XINPUT_STATE *state, const void *caller)
+ {
+     struct xinput_state_params params = {0};
+     struct xinput_pad_state *pad = &params.state;
+ 
++    if (title_pad_hidden(index, caller)) return FALSE;
+     params.index = index;
+     if (index >= XUSER_MAX_COUNT || __wine_unix_call(title_pad, unix_pad_state, &params) || !pad->connected) return FALSE;
+     memset(state, 0, sizeof(*state));
+@@ -924,7 +981,7 @@ DWORD WINAPI DECLSPEC_HOTPATCH XInputSetState(DWORD index, XINPUT_VIBRATION *vib
+         XINPUT_STATE state;
+ 
+         if (index >= XUSER_MAX_COUNT || !vibration) return ERROR_BAD_ARGUMENTS;
+-        if (!title_pad_state(index, &state)) return ERROR_DEVICE_NOT_CONNECTED;
++        if (!title_pad_state(index, &state, __builtin_return_address(0))) return ERROR_DEVICE_NOT_CONNECTED;
+         EnterCriticalSection(&xinput_cs);
+         title_pad_vibration[index] = *vibration;
+         title_pad_rumble(index);
+@@ -949,7 +1006,7 @@ DWORD WINAPI DECLSPEC_HOTPATCH XInputSetState(DWORD index, XINPUT_VIBRATION *vib
+ 
+ /* Some versions of SteamOverlayRenderer hot-patch XInputGetStateEx() and call
+  * XInputGetState() in the hook, so we need a wrapper. */
+-static DWORD xinput_get_state(DWORD index, XINPUT_STATE *state)
++static DWORD xinput_get_state(DWORD index, XINPUT_STATE *state, const void *caller)
+ {
+     DWORD ret;
+ 
+@@ -957,7 +1014,7 @@ static DWORD xinput_get_state(DWORD index, XINPUT_STATE *state)
+     if (has_title_pad())
+     {
+         if (index >= XUSER_MAX_COUNT) return ERROR_BAD_ARGUMENTS;
+-        return title_pad_state(index, state) ? ERROR_SUCCESS : ERROR_DEVICE_NOT_CONNECTED;
++        return title_pad_state(index, state, caller) ? ERROR_SUCCESS : ERROR_DEVICE_NOT_CONNECTED;
+     }
+ 
+     start_update_thread();
+@@ -979,7 +1036,7 @@ DWORD WINAPI DECLSPEC_HOTPATCH XInputGetState(DWORD index, XINPUT_STATE *state)
+ 
+     TRACE("index %lu, state %p.\n", index, state);
+ 
+-    ret = xinput_get_state(index, state);
++    ret = xinput_get_state(index, state, __builtin_return_address(0));
+     if (ret != ERROR_SUCCESS) return ret;
+ 
+     /* The main difference between this and the Ex version is the media guide button */
+@@ -992,7 +1049,7 @@ DWORD WINAPI DECLSPEC_HOTPATCH XInputGetStateEx(DWORD index, XINPUT_STATE *state
+ {
+     TRACE("index %lu, state %p.\n", index, state);
+ 
+-    return xinput_get_state(index, state);
++    return xinput_get_state(index, state, __builtin_return_address(0));
+ }
+ 
+ static const int JS_STATE_OFF = 0;
+@@ -1215,6 +1272,7 @@ DWORD WINAPI DECLSPEC_HOTPATCH XInputGetCapabilities(DWORD index, DWORD flags, X
+     XINPUT_CAPABILITIES_EX caps_ex;
+     DWORD ret;
+ 
++    if (has_title_pad() && title_pad_hidden(index, __builtin_return_address(0))) return ERROR_DEVICE_NOT_CONNECTED;
+     ret = XInputGetCapabilitiesEx(1, index, flags, &caps_ex);
+ 
+     if (!ret) *capabilities = caps_ex.Capabilities;
+@@ -1233,7 +1291,7 @@ DWORD WINAPI DECLSPEC_HOTPATCH XInputGetDSoundAudioDeviceGuids(DWORD index, GUID
+     if (has_title_pad())
+     {
+         XINPUT_STATE state;
+-        return title_pad_state(index, &state) ? ERROR_NOT_SUPPORTED : ERROR_DEVICE_NOT_CONNECTED;
++        return title_pad_state(index, &state, __builtin_return_address(0)) ? ERROR_NOT_SUPPORTED : ERROR_DEVICE_NOT_CONNECTED;
+     }
+ 
+     EnterCriticalSection(&xinput_cs);
+@@ -1254,7 +1312,7 @@ DWORD WINAPI DECLSPEC_HOTPATCH XInputGetBatteryInformation(DWORD index, BYTE typ
+     if (has_title_pad())
+     {
+         XINPUT_STATE state;
+-        return title_pad_state(index, &state) ? ERROR_NOT_SUPPORTED : ERROR_DEVICE_NOT_CONNECTED;
++        return title_pad_state(index, &state, __builtin_return_address(0)) ? ERROR_NOT_SUPPORTED : ERROR_DEVICE_NOT_CONNECTED;
+     }
+ 
+     EnterCriticalSection(&xinput_cs);
+@@ -1278,7 +1336,7 @@ DWORD WINAPI DECLSPEC_HOTPATCH XInputGetCapabilitiesEx(DWORD unk, DWORD index, D
+         struct xinput_caps_params params = {0};
+ 
+         if (index >= XUSER_MAX_COUNT) return ERROR_BAD_ARGUMENTS;
+-        if (!title_pad_state(index, &state)) return ERROR_DEVICE_NOT_CONNECTED;
++        if (!title_pad_state(index, &state, __builtin_return_address(0))) return ERROR_DEVICE_NOT_CONNECTED;
+ 
+         params.index = index;
+         if (!caps) return ERROR_BAD_ARGUMENTS;
+-- 
+2.43.0
+
